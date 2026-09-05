@@ -24,7 +24,8 @@
     { "type": "plugin", "id": "maibot-team.napcat-adapter", "version_spec": ">=0.1.0" },
     { "type": "python_package", "name": "httpx", "version_spec": ">=0.27" },
     { "type": "python_package", "name": "beautifulsoup4", "version_spec": ">=4.0" },
-    { "type": "python_package", "name": "json5", "version_spec": ">=0.0.1" }
+    { "type": "python_package", "name": "json5", "version_spec": ">=0.0.1" },
+    { "type": "python_package", "name": "pillow", "version_spec": ">=10.0" }
   ],
   "capabilities": [
     "send.text",

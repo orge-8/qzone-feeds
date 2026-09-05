@@ -56,6 +56,11 @@ class ReadConfig(PluginConfigBase):
     max_count: int = Field(default=15, description="单次读取上限")
     enable_image_description: bool = Field(default=True, description="是否启用图片VLM描述")
     vision_model: str = Field(default="", description="视觉模型任务名，留空则显示[图片]占位符")
+    max_images_per_feed: int = Field(default=3, description="单条动态最多识别几张图（VLM 慢，越多越耗时）")
+    image_concurrency: int = Field(default=3, description="图片识别并发数（VLM 单张常需 20s+）")
+    enable_image_compress: bool = Field(default=True, description="送VLM前压缩图片（省token/加速，关闭则用原图）")
+    image_max_edge: int = Field(default=1024, description="压缩后长边像素上限（256~4096）")
+    image_quality: int = Field(default=80, description="JPEG压缩质量 10~95")
 
 
 class PublishConfig(PluginConfigBase):
@@ -114,6 +119,10 @@ class QzoneFeedsConfig(PluginConfigBase):
 
 
 # ===== 工具 =====
+# Host 对插件命令的硬超时（plugin.invoke_command 60000ms，真机日志实测）。
+# 命令侧必须在此时限内返回，否则 Host 报 [E_TIMEOUT]；留 10s 安全边界。
+_HOST_COMMAND_TIMEOUT_SEC = 50.0
+
 _URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 
@@ -171,6 +180,10 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         logger = self.ctx.logger
         set_qzoneapi_logger(logger)
         set_vision_logger(logger)
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            logger.warning("Pillow 未安装，VLM 图片压缩不可用（将回退原图，略费 token/耗时）")
         from . import auto_tasks as _auto
         from . import cookie_manager as _cm
         from . import processed_store as _ps
@@ -272,11 +285,13 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         return False, "权限不足", 1
 
     # ---------- 串行队列 ----------
-    async def _enqueue_job(self, job_name: str, run_fn, wait_timeout: float | None = None) -> dict:
+    async def _enqueue_job(self, job_name: str, run_fn, wait_timeout: float | None = None,
+                           stream_id: str | None = None) -> dict:
         """投入队列并等待完成。
 
         wait_timeout=None（自动任务）：无限等待，长任务不会被误杀；
-        wait_timeout=数值（命令侧）：等待结果超时则返回错误，不再永久挂起。
+        wait_timeout=数值（命令侧）：等待超时即先回报，任务继续在后台跑，
+        完成后若给了 stream_id 会自动把结果补发到原会话（避开 Host 60s 命令硬超时）。
         任务级不设总超时——所有网络请求自带超时，长任务由条数自然延长。
         """
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -296,10 +311,25 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         if wait_timeout is None:
             return await fut
         try:
-            return await asyncio.wait_for(fut, timeout=wait_timeout)
+            # shield 保护 fut：wait_for 超时只取消「等待外壳」，fut 本身不被 cancel，
+            # worker 完成后 _deliver_late 仍能 await 到结果并补发
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=wait_timeout)
         except asyncio.TimeoutError:
-            # 超时后 worker 稍后回填时 fut 已 done，callback 的 done 检查保证不炸
-            return {"ok": False, "msg": f"等待任务结果超时（>{int(wait_timeout)}s），任务仍在后台执行"}
+            # 超时仅代表「命令侧先撤」，任务仍在 worker 中执行
+            if stream_id:
+                asyncio.create_task(self._deliver_late(fut, stream_id))
+            return {"ok": False, "msg": f"任务仍需一些时间（>{int(wait_timeout)}s），将在完成后自动发送结果"}
+
+    async def _deliver_late(self, fut: asyncio.Future, stream_id: str) -> None:
+        """后台任务完成后，把结果补发到原会话（命令侧已提前返回）。"""
+        try:
+            result = await fut
+        except Exception as e:
+            result = {"ok": False, "msg": f"后台任务失败: {e}"}
+        try:
+            await self.ctx.send.text(str(result.get("msg", "")), stream_id)
+        except Exception as e:
+            self.ctx.logger.error(f"补发结果失败: {e}")
 
     async def _worker(self):
         while True:
@@ -343,13 +373,18 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         return {"ok": False, "msg": f"登录态失效且重登后仍失败: {last_err}"}
 
     async def _run_command_job(self, stream_id: str, run_fn):
-        """命令侧入口：入队 → 回发结果到 stream_id。等待结果有超时保护。"""
+        """命令侧入口：入队 → 回发结果到 stream_id。
+
+        Host 对插件命令有 60s 硬超时（plugin.invoke_command），因此命令侧最多等 50s，
+        超时先回报、任务继续跑，完成后由 _deliver_late 自动补发结果。
+        """
         try:
-            wait_timeout = float(self.config.queue.queue_timeout_sec or 120)
+            cfg_timeout = float(self.config.queue.queue_timeout_sec or 120)
         except (AttributeError, RuntimeError, TypeError, ValueError):
-            wait_timeout = 120.0
+            cfg_timeout = 120.0
+        wait_timeout = min(cfg_timeout, _HOST_COMMAND_TIMEOUT_SEC)
         try:
-            result = await self._enqueue_job("command", run_fn, wait_timeout=wait_timeout)
+            result = await self._enqueue_job("command", run_fn, wait_timeout=wait_timeout, stream_id=stream_id)
         except Exception as e:
             result = {"ok": False, "msg": f"任务提交失败: {e}"}
         await self.ctx.send.text(str(result.get("msg", "")), stream_id)
@@ -421,7 +456,11 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         count = self._clip_count(kwargs.get("matched_groups", {}).get("count"))
 
         async def run(api: QzoneAPI) -> dict:
-            feeds = await api.get_qzone_list(describe_images=self._vision_enabled())
+            max_img, conc = self._vision_limits()
+            comp, edge, q = self._compress_params()
+            feeds = await api.get_qzone_list(
+                describe_images=self._vision_enabled(), max_images=max_img, image_concurrency=conc,
+                compress=comp, max_edge=edge, quality=q)
             if not feeds:
                 return {"ok": False, "msg": "好友动态获取为空"}
             if isinstance(feeds[0], dict) and feeds[0].get("error"):
@@ -442,7 +481,11 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         count = self._clip_count(kwargs.get("matched_groups", {}).get("count"))
 
         async def run(api: QzoneAPI) -> dict:
-            feeds = await api.get_list(qq, count, filter=True, describe_images=self._vision_enabled())
+            max_img, conc = self._vision_limits()
+            comp, edge, q = self._compress_params()
+            feeds = await api.get_list(qq, count, filter=True, describe_images=self._vision_enabled(),
+                                       max_images=max_img, image_concurrency=conc,
+                                       compress=comp, max_edge=edge, quality=q)
             if not feeds:
                 return {"ok": False, "msg": f"QQ {qq} 的说说获取为空"}
             if isinstance(feeds[0], dict) and feeds[0].get("error"):
@@ -463,7 +506,11 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         count = self._clip_count(kwargs.get("matched_groups", {}).get("count"))
 
         async def run(api: QzoneAPI) -> dict:
-            feeds = await api.get_list(qq, count, filter=True, describe_images=self._vision_enabled())
+            max_img, conc = self._vision_limits()
+            comp, edge, q = self._compress_params()
+            feeds = await api.get_list(qq, count, filter=True, describe_images=self._vision_enabled(),
+                                       max_images=max_img, image_concurrency=conc,
+                                       compress=comp, max_edge=edge, quality=q)
             if not feeds:
                 return {"ok": False, "msg": f"QQ {qq} 的说说获取为空"}
             if isinstance(feeds[0], dict) and feeds[0].get("error"):
@@ -548,8 +595,28 @@ class QzoneFeedsPlugin(MaiBotPlugin):
     def _vision_enabled(self) -> bool:
         try:
             return bool(self.config.read.enable_image_description)
-        except AttributeError:
+        except (AttributeError, RuntimeError):
             return True
+
+    def _vision_limits(self) -> tuple[int, int]:
+        """(单条动态最大图片数, 并发数)。"""
+        try:
+            max_img = max(0, int(self.config.read.max_images_per_feed or 3))
+            conc = max(1, int(self.config.read.image_concurrency or 3))
+            return max_img, conc
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return 3, 3
+
+    def _compress_params(self) -> tuple[bool, int, int]:
+        """(是否压缩, 长边像素上限, JPEG质量)。参数裁剪到安全区间。"""
+        try:
+            cfg = self.config.read
+            on = bool(cfg.enable_image_compress)
+            edge = max(256, min(int(cfg.image_max_edge or 1024), 4096))
+            q = max(10, min(int(cfg.image_quality or 80), 95))
+            return on, edge, q
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return True, 1024, 80
 
 
 def create_plugin() -> QzoneFeedsPlugin:

@@ -4,6 +4,7 @@
 vision_model 为空或调用失败时回退占位文本。
 """
 import asyncio
+import base64
 
 
 # ===== logger =====
@@ -43,6 +44,23 @@ _DESCRIBE_PROMPT = (
 )
 
 
+def _guess_image_mime(image_base64: str) -> str:
+    """按 magic bytes 探测图片 MIME（只解 base64 头部片段），失败默认 jpeg。"""
+    try:
+        head = base64.b64decode(image_base64[:32])
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "image/webp"
+        if head[:3] == b"GIF":
+            return "image/gif"
+        if head[:3] == b"\xff\xd8\xff":
+            return "image/jpeg"
+    except Exception:
+        pass
+    return "image/jpeg"
+
+
 class VisionManager:
     """基于 Host llm.generate 的图片描述生成器。
 
@@ -65,7 +83,7 @@ class VisionManager:
             return True
 
     def _build_messages(self, image_base64: str) -> list[dict]:
-        data_url = f"data:image/jpeg;base64,{image_base64}"
+        data_url = f"data:{_guess_image_mime(image_base64)};base64,{image_base64}"
         return [
             {
                 "role": "user",

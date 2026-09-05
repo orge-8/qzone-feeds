@@ -37,6 +37,9 @@ admin_ids = ["qq:你的QQ号"]   # 必填，否则所有命令都会被拒
 
 [read]
 vision_model = "vlm"          # 视觉模型任务名；留空则图片显示为 [图片]
+enable_image_compress = true  # 送 VLM 前压缩图片（省 token/加速；false=用原图）
+image_max_edge = 1024         # 压缩后长边像素上限（256~4096）
+image_quality = 80            # JPEG 压缩质量 10~95
 
 [auto]
 enable_auto_read = false      # 定时自动读好友动态并点赞/评论
@@ -50,7 +53,7 @@ comment_probability = 0.6
 ## 依赖与登录态
 
 - 硬依赖 **napcat-adapter**：cookie 通过 `adapter.napcat.account.get_cookies` 自动获取，无需扫码
-- python 依赖：httpx / bs4 / json5（manifest 已声明）
+- python 依赖：httpx / bs4 / json5 / pillow（manifest 已声明）
 
 ## 架构
 

@@ -8,6 +8,7 @@
 5. 去掉 create_qzone_api() 的本地文件依赖，由 cookie_manager 构造 QzoneAPI
 """
 
+import asyncio
 import base64
 import json
 import time
@@ -16,6 +17,8 @@ from typing import Any
 import httpx
 import json5
 import bs4
+
+from .image_compress import compress_image_bytes
 
 
 # ===== logger（可选注入）=====
@@ -484,11 +487,47 @@ class QzoneAPI:
             logger.error(f"回复失败，错误码: {res.status_code}")
             return False
 
-    async def get_list(self, target_qq: str, num: int, filter: bool = True, describe_images: bool = True) -> list[dict[str, Any]]:
+    async def _describe_images(self, urls: list[str], max_images: int, concurrency: int,
+                               compress: bool = True, max_edge: int = 1024, quality: int = 80) -> list[str]:
+        """并发下载+描述图片，保序返回（VLM 单张常需 20s+，串行会导致命令超时）。
+
+        compress=True 时送 VLM 前压缩（长边 ≤max_edge + JPEG 质量 quality），
+        降低 token 消耗与耗时；压缩失败（缺 Pillow/解码失败）回退原图。
+        """
+        urls = [u for u in urls if u][:max_images]
+        if not urls:
+            return []
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def describe(url: str):
+            async with sem:
+                try:
+                    image_base64 = await self.get_image_base64_by_url(url, with_cookies=True)
+                    if not image_base64:
+                        logger.warning(f"获取图片失败: {url}")
+                        return "[图片（加载失败）]"
+                    if compress:
+                        raw = base64.b64decode(image_base64)
+                        out = await asyncio.to_thread(compress_image_bytes, raw, max_edge, quality)
+                        if out:
+                            image_base64 = base64.b64encode(out).decode("utf-8")
+                    return await image_manager.get_image_description(image_base64)
+                except Exception as e:
+                    logger.warning(f"获取图片描述失败: {e}")
+                    return "[图片（识别失败）]"
+
+        results = await asyncio.gather(*[describe(u) for u in urls], return_exceptions=True)
+        return [r for r in results if isinstance(r, str)]
+
+    async def get_list(self, target_qq: str, num: int, filter: bool = True, describe_images: bool = True,
+                       max_images: int = 3, image_concurrency: int = 3,
+                       compress: bool = True, max_edge: int = 1024, quality: int = 80) -> list[dict[str, Any]]:
         """获取指定QQ号的说说列表（jsonp 剥壳 _preloadCallback(...)）。
 
         评论在 msg["commentlist"]（name/content/uin/tid/createTime，楼中楼 list_3[]）。
         describe_images=False 时跳过图片下载与VLM描述（reply_manager 回评时用，省时省流量）。
+        max_images / image_concurrency：限制单条动态图片数与并发度，防 VLM 慢导致命令超时。
+        compress / max_edge / quality：送 VLM 前压缩图片（省 token），失败回退原图。
         """
         logger.info(f"即将获取 {target_qq} 的说说列表...num={num} filter={filter}")
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
@@ -576,32 +615,16 @@ class QzoneAPI:
             tid = str(msg.get("tid", ""))
             content = msg.get("content", "")
 
-            # 图片与视频封面 → VLM 描述
+            # 图片与视频封面 → VLM 描述（并发，保序）
             images = []
             if describe_images:
-
-                async def append_image_description(url: str):
-                    if not url:
-                        return
-                    try:
-                        image_base64 = await self.get_image_base64_by_url(url)
-                        if not image_base64:
-                            logger.warning(f"获取图片失败: {url}")
-                            # 下载失败也留占位符，让下游 LLM 知道该动态有图（只是没看到）
-                            images.append("[图片（加载失败）]")
-                            return
-                        image_description = await image_manager.get_image_description(image_base64)
-                        images.append(image_description)
-                    except Exception as img_err:
-                        logger.warning(f"获取图片描述失败: {img_err}")
-                        images.append("[图片（识别失败）]")
-
+                urls = []
                 for pic in (msg.get("pic") or []):
-                    url = pic.get("url1") or pic.get("pic_id") or pic.get("smallurl")
-                    await append_image_description(url)
+                    urls.append(pic.get("url1") or pic.get("pic_id") or pic.get("smallurl"))
                 for video in (msg.get("video") or []):
-                    video_image_url = video.get("url1") or video.get("pic_url")
-                    await append_image_description(video_image_url)
+                    urls.append(video.get("url1") or video.get("pic_url"))
+                images = await self._describe_images(urls, max_images, image_concurrency,
+                                                     compress=compress, max_edge=max_edge, quality=quality)
 
             # 视频播放地址
             videos = []
@@ -657,11 +680,14 @@ class QzoneAPI:
 
         return feeds_list
 
-    async def get_qzone_list(self, describe_images: bool = True) -> list[dict[str, Any]]:
+    async def get_qzone_list(self, describe_images: bool = True,
+                             max_images: int = 3, image_concurrency: int = 3,
+                             compress: bool = True, max_edge: int = 1024, quality: int = 80) -> list[dict[str, Any]]:
         """获取好友动态流（feeds3_html_more，剥壳 _Callback(...) + undefined→null + json5.loads）。
 
         只保留 appid=='311'（说说）；HTML 用 BS4 从 div.img-box 抠 img[src]，过滤 qzonestyle.gtimg.cn。
         describe_images=False 时跳过图片下载与VLM描述。
+        compress / max_edge / quality：送 VLM 前压缩图片（省 token），失败回退原图。
         """
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             res = await client.request(
@@ -760,22 +786,11 @@ class QzoneAPI:
                     image_urls.append(img_tag["src"])
                 unique_urls = list(dict.fromkeys(image_urls))
 
-                # VLM 描述
+                # VLM 描述（并发，保序）
                 images = []
                 if describe_images:
-                    for url in unique_urls:
-                        try:
-                            image_base64 = await self.get_image_base64_by_url(url)
-                            if not image_base64:
-                                logger.warning(f"获取图片失败: {url}")
-                                # 下载失败也留占位符，让下游 LLM 知道该动态有图（只是没看到）
-                                images.append("[图片（加载失败）]")
-                                continue
-                            description = await image_manager.get_image_description(image_base64)
-                            images.append(description)
-                        except Exception as e:
-                            logger.info(f"图片识别失败: {url} - {str(e)}")
-                            images.append("[图片（识别失败）]")
+                    images = await self._describe_images(unique_urls, max_images, image_concurrency,
+                                                         compress=compress, max_edge=max_edge, quality=quality)
 
                 # 视频url
                 videos = []
