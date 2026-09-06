@@ -511,6 +511,14 @@ class QzoneAPI:
                         out = await asyncio.to_thread(compress_image_bytes, raw, max_edge, quality)
                         if out:
                             image_base64 = base64.b64encode(out).decode("utf-8")
+                            if len(out) < len(raw):
+                                logger.info(
+                                    f"图片压缩 {len(raw) / 1024:.0f}KB → {len(out) / 1024:.0f}KB"
+                                    f"（长边≤{max_edge} 质量{quality}，省 {100 - len(out) * 100 // len(raw)}%）")
+                        else:
+                            logger.warning(
+                                f"图片压缩失败，回退原图 {len(raw) / 1024:.0f}KB"
+                                f"（缺 Pillow 或解码失败，检查 manifest 依赖 pillow）")
                     return await image_manager.get_image_description(image_base64)
                 except Exception as e:
                     logger.warning(f"获取图片描述失败: {e}")
@@ -520,7 +528,7 @@ class QzoneAPI:
         return [r for r in results if isinstance(r, str)]
 
     async def get_list(self, target_qq: str, num: int, filter: bool = True, describe_images: bool = True,
-                       max_images: int = 3, image_concurrency: int = 3,
+                       max_images: int = 9, image_concurrency: int = 3,
                        compress: bool = True, max_edge: int = 1024, quality: int = 80) -> list[dict[str, Any]]:
         """获取指定QQ号的说说列表（jsonp 剥壳 _preloadCallback(...)）。
 
@@ -681,7 +689,7 @@ class QzoneAPI:
         return feeds_list
 
     async def get_qzone_list(self, describe_images: bool = True,
-                             max_images: int = 3, image_concurrency: int = 3,
+                             max_images: int = 9, image_concurrency: int = 3,
                              compress: bool = True, max_edge: int = 1024, quality: int = 80) -> list[dict[str, Any]]:
         """获取好友动态流（feeds3_html_more，剥壳 _Callback(...) + undefined→null + json5.loads）。
 

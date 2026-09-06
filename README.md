@@ -37,6 +37,8 @@ admin_ids = ["qq:你的QQ号"]   # 必填，否则所有命令都会被拒
 
 [read]
 vision_model = "vlm"          # 视觉模型任务名；留空则图片显示为 [图片]
+max_images_per_feed = 9       # 单条动态最多识别几张图（QQ空间上限9，越多越耗时）
+image_concurrency = 3         # 图片识别并发数
 enable_image_compress = true  # 送 VLM 前压缩图片（省 token/加速；false=用原图）
 image_max_edge = 1024         # 压缩后长边像素上限（256~4096）
 image_quality = 80            # JPEG 压缩质量 10~95
