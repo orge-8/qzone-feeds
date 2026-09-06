@@ -27,6 +27,39 @@ from .reply_manager import ReplyManager
 from .vision import VisionManager, set_vision_logger
 
 
+# Host 对插件命令有 60s 硬超时（plugin.invoke_command），命令侧最多等 50s
+_HOST_COMMAND_TIMEOUT_SEC = 50.0
+# 单条消息字符上限：QQ 长消息易被截断/风控，超出则按动态边界分块发送
+_MAX_MSG_CHARS = 1200
+
+
+def split_message(text: str, limit: int = _MAX_MSG_CHARS) -> list[str]:
+    """按动态分隔线边界切分长消息，尽量不在单条动态中间断开。"""
+    if len(text) <= limit:
+        return [text]
+    blocks = text.split("──────")
+    chunks: list[str] = []
+    cur = ""
+    for i, blk in enumerate(blocks):
+        piece = blk + ("──────" if i < len(blocks) - 1 else "")
+        if len(cur) + len(piece) > limit and cur:
+            chunks.append(cur.rstrip())
+            cur = piece
+        else:
+            cur += piece
+    if cur.strip():
+        chunks.append(cur.rstrip())
+    # 单块仍超限（例如一条超长动态）时按字符硬切，保证不丢内容
+    out: list[str] = []
+    for c in chunks:
+        while len(c) > limit:
+            out.append(c[:limit])
+            c = c[limit:]
+        if c:
+            out.append(c)
+    return out or [text[:limit]]
+
+
 # ===== 配置模型 =====
 class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "基础配置"
@@ -56,7 +89,7 @@ class ReadConfig(PluginConfigBase):
     max_count: int = Field(default=15, description="单次读取上限")
     enable_image_description: bool = Field(default=True, description="是否启用图片VLM描述")
     vision_model: str = Field(default="", description="视觉模型任务名，留空则显示[图片]占位符")
-    max_images_per_feed: int = Field(default=3, description="单条动态最多识别几张图（VLM 慢，越多越耗时）")
+    max_images_per_feed: int = Field(default=9, description="单条动态最多识别几张图（QQ空间单条上限9，越多越耗时）")
     image_concurrency: int = Field(default=3, description="图片识别并发数（VLM 单张常需 20s+）")
     enable_image_compress: bool = Field(default=True, description="送VLM前压缩图片（省token/加速，关闭则用原图）")
     image_max_edge: int = Field(default=1024, description="压缩后长边像素上限（256~4096）")
@@ -119,10 +152,6 @@ class QzoneFeedsConfig(PluginConfigBase):
 
 
 # ===== 工具 =====
-# Host 对插件命令的硬超时（plugin.invoke_command 60000ms，真机日志实测）。
-# 命令侧必须在此时限内返回，否则 Host 报 [E_TIMEOUT]；留 10s 安全边界。
-_HOST_COMMAND_TIMEOUT_SEC = 50.0
-
 _URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 
@@ -149,7 +178,13 @@ def format_feed(feed: dict, index: int | None = None) -> str:
         lines.append(body)
     images = feed.get("images") or []
     if images:
-        lines.append("🖼 " + " / ".join(images))
+        if len(images) <= 2:
+            lines.append("🖼 " + " / ".join(images))
+        else:
+            # 3 张以上逐条编号换行，否则一整行描述挤在一起没法读
+            lines.append(f"🖼 共 {len(images)} 张：")
+            for i, desc in enumerate(images, 1):
+                lines.append(f"  {i}. {desc}")
     videos = feed.get("videos") or []
     if videos:
         lines.append(f"🎬 视频 x{len(videos)}")
@@ -320,6 +355,20 @@ class QzoneFeedsPlugin(MaiBotPlugin):
                 asyncio.create_task(self._deliver_late(fut, stream_id))
             return {"ok": False, "msg": f"任务仍需一些时间（>{int(wait_timeout)}s），将在完成后自动发送结果"}
 
+    async def _send_chunked(self, text: str, stream_id: str) -> None:
+        """发送结果，超长时按动态边界分块（带 (i/n) 序号，块间留间隔防风控）。"""
+        text = str(text or "")
+        if not text:
+            return
+        chunks = split_message(text)
+        if len(chunks) == 1:
+            await self.ctx.send.text(chunks[0], stream_id)
+            return
+        for i, chunk in enumerate(chunks, 1):
+            await self.ctx.send.text(f"({i}/{len(chunks)})\n{chunk}", stream_id)
+            if i < len(chunks):
+                await asyncio.sleep(0.5)
+
     async def _deliver_late(self, fut: asyncio.Future, stream_id: str) -> None:
         """后台任务完成后，把结果补发到原会话（命令侧已提前返回）。"""
         try:
@@ -327,7 +376,7 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         except Exception as e:
             result = {"ok": False, "msg": f"后台任务失败: {e}"}
         try:
-            await self.ctx.send.text(str(result.get("msg", "")), stream_id)
+            await self._send_chunked(str(result.get("msg", "")), stream_id)
         except Exception as e:
             self.ctx.logger.error(f"补发结果失败: {e}")
 
@@ -387,7 +436,7 @@ class QzoneFeedsPlugin(MaiBotPlugin):
             result = await self._enqueue_job("command", run_fn, wait_timeout=wait_timeout, stream_id=stream_id)
         except Exception as e:
             result = {"ok": False, "msg": f"任务提交失败: {e}"}
-        await self.ctx.send.text(str(result.get("msg", "")), stream_id)
+        await self._send_chunked(str(result.get("msg", "")), stream_id)
         return result
 
     # ---------- 命令 ----------
@@ -601,11 +650,11 @@ class QzoneFeedsPlugin(MaiBotPlugin):
     def _vision_limits(self) -> tuple[int, int]:
         """(单条动态最大图片数, 并发数)。"""
         try:
-            max_img = max(0, int(self.config.read.max_images_per_feed or 3))
+            max_img = max(0, int(self.config.read.max_images_per_feed or 9))
             conc = max(1, int(self.config.read.image_concurrency or 3))
             return max_img, conc
         except (AttributeError, RuntimeError, TypeError, ValueError):
-            return 3, 3
+            return 9, 3
 
     def _compress_params(self) -> tuple[bool, int, int]:
         """(是否压缩, 长边像素上限, JPEG质量)。参数裁剪到安全区间。"""
