@@ -42,6 +42,8 @@ image_concurrency = 3         # 图片识别并发数
 enable_image_compress = true  # 送 VLM 前压缩图片（省 token/加速；false=用原图）
 image_max_edge = 1024         # 压缩后长边像素上限（256~4096）
 image_quality = 80            # JPEG 压缩质量 10~95
+enable_desc_cache = true      # 缓存图片VLM描述（同一图片URL不重复识别）
+desc_cache_size = 200         # VLM描述缓存容量（LRU条数，重启清空）
 
 [auto]
 enable_auto_read = false      # 定时自动读好友动态并点赞/评论
@@ -60,19 +62,28 @@ comment_probability = 0.6
 ## 架构
 
 ```
-plugin.py            生命周期 + 6 命令 + 鉴权 + 串行队列 worker + 自动任务启停
-qzone_api.py         QQ空间协议层（移植自 Maizone，5 处缺陷修正）
+plugin.py            生命周期 + 7 命令 + 鉴权 + 串行队列 worker + 自动任务启停
+qzone_api.py         QQ空间协议层（移植自 Maizone，5 处缺陷修正；共享 httpx client）
 cookie_manager.py    adapter 取 cookie + 节流 + data_dir 落盘
-vision.py            VLM 图片描述（llm.generate 多模态）
+vision.py            VLM 图片描述（llm.generate 多模态 + URL LRU 缓存）
 reply_manager.py     回评流程：扫描/去重/LLM/调用 reply
 auto_tasks.py        自动任务循环 + 静默时段解析
-processed_store.py   已处理记录（LRU 200 feeds / 100 comments，原子落盘）
+processed_store.py   已处理记录（LRU 200 feeds / 100 comments，防抖批量落盘）
 ```
 
 - **串行队列**：所有 QQ 空间写操作（发/评/赞/回）走单 worker 队列，自动任务与手动命令同队列，防并发风控
 - **自动重登**：cookie 失效（登录类错误码）自动强制刷新重试（默认 1 次）
 - **去重**：`processed_list.json`（`ctx.paths.data_dir`）记录已处理动态/评论，手动与自动共享
 - **反风控**：逐条操作间 `3~4s` 随机间隔；静默时段自动任务全停
+- **凭据与出站防护**（v1.1.1）：
+  - 读动态下载图片时，只对 QQ 图床域名（`.qzone.qq.com` / `.gtimg.cn` / `.qq.com`）携带 cookie；手动跟随重定向且**每一跳都重新校验域名**，防止 `p_skey` 被一条恶意 `<img src>` 或 302 带到第三方主机
+  - `/动态发图` 的用户可控地址做 SSRF 校验（拒绝内网 / 回环 / 链路本地 / 保留网段，主机名解析后逐条判定），且该链路下载时不带 Qzone cookie
+- **性能优化**（v1.1.0）：
+  - 共享 httpx 连接池：每个 job 内所有请求复用同一 AsyncClient（省 TCP+TLS 握手）
+  - 已处理列表防抖落盘：mark 只改内存，2s 防抖批量写盘 + job 边界兜底（写盘次数降一个数量级）
+  - VLM 描述缓存：同一图片 URL 不重复下载/识别（单张省 20s+ 与全部 token，命中日志 `图片描述命中缓存`）
+  - VLM 下载小图优先（`smallurl`），下载字节数降 5~10 倍
+  - 图片压缩走内存 bytes 直传，只在送 VLM 边界做一次 base64 编码
 
 ## 相对上游 Maizone 的修正
 
@@ -85,11 +96,12 @@ processed_store.py   已处理记录（LRU 200 feeds / 100 comments，原子落�
 ## 测试
 
 ```bash
-# 冒烟测试（98 项，FakeHost，不启 MaiBot）
-python plugins/qzone-feeds/tests/test_qzone_feeds.py
-# 结构自检
-python check_plugin.py plugins/qzone-feeds
+# 行为测试（90 项：逻辑 + 鉴权 + 命令正则 + 安全验证 + 生命周期/Manifest）
+python tests/run_tests.py
 ```
+
+不依赖 MaiBot 与真实网络（maibot_sdk 用 stub 注入，出站请求用 `httpx.MockTransport` 拦截），
+可直接在插件目录下运行。上线前需 **90/90 全过**。
 
 ## 部署
 
