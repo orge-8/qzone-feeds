@@ -65,10 +65,13 @@ class VisionManager:
     """基于 Host llm.generate 的图片描述生成器。
 
     模型名取自配置 read.vision_model；为空时退化为占位符。
+    按图片 URL 做内存 LRU 缓存（read.enable_desc_cache / read.desc_cache_size），
+    同一图片重复出现时不再下载与识别。缓存只驻内存，重启清空。
     """
 
     def __init__(self, plugin):
         self._plugin = plugin
+        self._desc_cache: dict[str, str] = {}  # url -> 描述（插入序 LRU）
 
     def _get_vision_model(self) -> str:
         try:
@@ -82,6 +85,41 @@ class VisionManager:
         except AttributeError:
             return True
 
+    def _get_cache_enabled(self) -> bool:
+        try:
+            return bool(self._plugin.config.read.enable_desc_cache)
+        except AttributeError:
+            return True
+
+    def _get_cache_size(self) -> int:
+        try:
+            return max(1, int(self._plugin.config.read.desc_cache_size or 200))
+        except (AttributeError, TypeError, ValueError):
+            return 200
+
+    def is_cached(self, url: str) -> bool:
+        """URL 是否已有缓存描述（命中即无需下载图片）。"""
+        if not url or not self._get_cache_enabled():
+            return False
+        return url in self._desc_cache
+
+    def _cache_get(self, url: str) -> str | None:
+        if not self._get_cache_enabled():
+            return None
+        desc = self._desc_cache.pop(url, None)
+        if desc is not None:
+            self._desc_cache[url] = desc  # LRU touch
+        return desc
+
+    def _cache_put(self, url: str, desc: str) -> None:
+        if not url or not self._get_cache_enabled():
+            return
+        self._desc_cache.pop(url, None)
+        self._desc_cache[url] = desc
+        limit = self._get_cache_size()
+        while len(self._desc_cache) > limit:
+            self._desc_cache.pop(next(iter(self._desc_cache)))
+
     def _build_messages(self, image_base64: str) -> list[dict]:
         data_url = f"data:{_guess_image_mime(image_base64)};base64,{image_base64}"
         return [
@@ -94,8 +132,17 @@ class VisionManager:
             }
         ]
 
-    async def get_image_description(self, image_base64: str) -> str:
-        """生成图片描述文本。任何失败都返回占位文本，不抛异常。"""
+    async def get_image_description(self, url: str, image_base64: str) -> str:
+        """生成图片描述文本。任何失败都返回占位文本，不抛异常。
+
+        url 用于缓存键；缓存命中时 image_base64 可为空串（无需下载）。
+        仅真实识别成功的描述写入缓存（占位符不入缓存，避免坏结果固化）。
+        """
+        if url:
+            cached = self._cache_get(url)
+            if cached is not None:
+                logger.info(f"图片描述命中缓存: {url[:80]}")
+                return cached
         if not self._get_enabled():
             return PLACEHOLDER
         vision_model = self._get_vision_model()
@@ -129,4 +176,6 @@ class VisionManager:
         if len(description) > MAX_DESC_CHARS:
             description = description[:MAX_DESC_CHARS]
         logger.info(f"图片描述生成成功（模型={vision_model}，长度={len(description)}）")
+        if url:
+            self._cache_put(url, description)
         return description

@@ -261,7 +261,6 @@ class AutoTaskLoop:
                 if _is_in_silent_period(self._silent_hours()):
                     logger.info("当前处于静默时段，跳过本轮自动任务")
                     continue
-                from .auto_tasks import run_auto_job  # 延迟引用避免循环导入
                 await self._enqueue("auto_job", run_auto_job)
             except asyncio.CancelledError:
                 break

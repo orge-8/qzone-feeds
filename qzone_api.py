@@ -11,8 +11,10 @@
 import asyncio
 import base64
 import json
+import re
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import json5
@@ -46,8 +48,11 @@ def set_qzoneapi_logger(custom_logger):
 
 # ===== 图片识别管理器（由 plugin 注入 VisionManager）=====
 class NoImageManager:
-    async def get_image_description(self, image_base64: str) -> str:
+    async def get_image_description(self, url: str, image_base64: str) -> str:
         return "[图片]"
+
+    def is_cached(self, url: str) -> bool:
+        return False
 
 
 image_manager: Any = NoImageManager()
@@ -150,6 +155,25 @@ class CookieExpiredError(Exception):
 # 图片下载上限：防恶意大文件/超大图撑爆内存（base64 展开再放大 1.33 倍）
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
+# 允许携带 Qzone cookie 下载图片的域名后缀（防凭据外发到第三方主机）
+_QZONE_IMAGE_HOST_SUFFIXES = (".qzone.qq.com", ".qzonestyle.gtimg.cn", ".gtimg.cn", ".qq.com")
+# 图片下载最多跟随几次重定向（每跳都要重新校验域名白名单）
+_MAX_REDIRECT_HOPS = 3
+_REDIRECT_STATUS = (301, 302, 303, 307, 308)
+
+
+def _is_allowed_image_host(url: str) -> bool:
+    """图片 URL 是否属于 QQ 图床域名。
+
+    图片 URL 来自远端返回的 HTML/JSON，不可信；携带 cookie 请求前必须校验，
+    否则一条恶意 <img src> 就能把 p_skey 送到攻击者主机。
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return bool(host) and host.endswith(_QZONE_IMAGE_HOST_SUFFIXES)
+
 
 # 登录类错误码：出现即认为登录态失效
 _LOGIN_ERROR_CODES = {1000000, 1000001, 1000002, 1000003, -3000, -3001, -14}
@@ -170,8 +194,25 @@ class QzoneAPI:
         self.qq_nickname = ""
         self.gtk2 = ""
         self.last_image_upload_failed = False
+        # 共享 httpx 客户端（lazy 创建，aclose() 关闭）：避免每请求重建 TCP+TLS
+        self._client: httpx.AsyncClient | None = None
         if "p_skey" in self.cookies:
             self.gtk2 = generate_gtk(self.cookies["p_skey"])
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """获取共享 AsyncClient（lazy 创建）。各请求用 per-request timeout 覆盖。"""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(follow_redirects=True)
+        return self._client
+
+    async def aclose(self) -> None:
+        """关闭共享客户端（job 结束时由队列 worker 调用）。"""
+        if self._client is not None and not self._client.is_closed:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+        self._client = None
 
     def _check_login_code(self, code) -> None:
         """登录类错误码 → 抛 CookieExpiredError 交给上层重登。"""
@@ -181,8 +222,8 @@ class QzoneAPI:
         except (TypeError, ValueError):
             pass
 
-    async def get_image_base64_by_url(self, url: str, with_cookies: bool = True) -> str | None:
-        """从指定URL获取图片并转base64。
+    async def _download_image_bytes(self, url: str, with_cookies: bool = True) -> bytes | None:
+        """下载图片返回 bytes（流式 + 大小上限）。
 
         with_cookies=True（默认）：Qzone 相册图床需要登录态，带 cookies 防 403。
         with_cookies=False：用户提供的任意 URL（如 /动态发图 的图片地址）——
@@ -190,15 +231,35 @@ class QzoneAPI:
         """
         if not url:
             return None
+        # 携带 cookie 出站前先校验域名：图片 URL 来自远端，不可信
+        if with_cookies and not _is_allowed_image_host(url):
+            logger.warning(f"图片域名不在图床白名单，已拒绝携带 cookie 下载: {url}")
+            return None
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Referer": "https://qzone.qq.com/",
         }
         cookies = self.cookies if with_cookies else None
         try:
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True, cookies=cookies) as client:
-                # 流式下载 + 大小上限：Content-Length 预检 + 累计截断
-                async with client.stream("GET", url, headers=headers) as response:
+            client = self._get_client()
+            # 流式下载 + 大小上限：Content-Length 预检 + 累计截断
+            # 手动跟随重定向（follow_redirects=False）：每一跳都重新校验域名白名单，
+            # 否则一条 302 就能把 cookie 带出白名单之外
+            current = url
+            for _hop in range(_MAX_REDIRECT_HOPS + 1):
+                async with client.stream("GET", current, headers=headers, cookies=cookies,
+                                         timeout=15, follow_redirects=False) as response:
+                    if response.status_code in _REDIRECT_STATUS:
+                        loc = response.headers.get("location")
+                        if not loc:
+                            logger.warning(f"重定向缺少 Location 头: {current}")
+                            return None
+                        nxt = str(httpx.URL(current).join(loc))
+                        if with_cookies and not _is_allowed_image_host(nxt):
+                            logger.warning(f"重定向目标不在图床白名单，中止下载（防凭据外发）: {nxt}")
+                            return None
+                        current = nxt
+                        continue
                     if response.status_code != 200:
                         logger.error(f"请求失败: {url} 状态码: {response.status_code}")
                         return None
@@ -217,20 +278,31 @@ class QzoneAPI:
                             logger.warning(f"图片超过大小上限（>{_MAX_IMAGE_BYTES} bytes），中止下载: {url}")
                             return None
                         chunks.append(chunk)
-                    content = b"".join(chunks)
+                    return b"".join(chunks)
+            logger.warning(f"图片重定向次数超限（>{_MAX_REDIRECT_HOPS}），放弃下载: {url}")
+            return None
         except httpx.RequestError as e:
             logger.warning(f"图片请求异常: {url} - {e}")
             return None
+        except Exception as e:
+            logger.warning(f"图片下载异常: {url} - {e}")
+            return None
 
+    async def get_image_base64_by_url(self, url: str, with_cookies: bool = True) -> str | None:
+        """从指定URL获取图片并转base64（/动态发图 命令用；内部走 _download_image_bytes）。"""
+        content = await self._download_image_bytes(url, with_cookies=with_cookies)
+        if content is None:
+            return None
         return base64.b64encode(content).decode("utf-8")
 
     async def upload_image(self, image: bytes) -> dict | None:
         """上传图片到QQ空间。响应切片 {...} 后 json.loads（弃用上游 eval）。"""
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            res = await client.request(
-                method="POST",
-                url=self.UPLOAD_IMAGE_URL,
-                data={
+        client = self._get_client()
+        res = await client.request(
+            method="POST",
+            url=self.UPLOAD_IMAGE_URL,
+            timeout=60,
+            data={
                     "filename": "filename",
                     "zzpanelkey": "",
                     "uploadtype": "1",
@@ -317,18 +389,19 @@ class QzoneAPI:
                 # 传了图但全部上传失败：QQ空间协议只能降级纯文本，标记给调用方
                 self.last_image_upload_failed = True
 
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            res = await client.request(
-                method="POST",
-                url=self.EMOTION_PUBLISH_URL,
-                params={"g_tk": self.gtk2, "uin": self.uin},
-                data=post_data,
-                headers={
-                    "referer": "https://user.qzone.qq.com/" + str(self.uin),
-                    "origin": "https://user.qzone.qq.com",
-                },
-                cookies=self.cookies,
-            )
+        client = self._get_client()
+        res = await client.request(
+            method="POST",
+            url=self.EMOTION_PUBLISH_URL,
+            timeout=10,
+            params={"g_tk": self.gtk2, "uin": self.uin},
+            data=post_data,
+            headers={
+                "referer": "https://user.qzone.qq.com/" + str(self.uin),
+                "origin": "https://user.qzone.qq.com",
+            },
+            cookies=self.cookies,
+        )
         if res.status_code == 200:
             code = extract_code_json(res.text)
             self._check_login_code(code)
@@ -361,18 +434,19 @@ class QzoneAPI:
             "format": "json",
             "fupdate": 1,
         }
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            res = await client.request(
-                method="POST",
-                url=self.DOLIKE_URL,
-                params={"g_tk": self.gtk2},
-                data=post_data,
-                headers={
-                    "referer": "https://user.qzone.qq.com/" + str(self.uin),
-                    "origin": "https://user.qzone.qq.com",
-                },
-                cookies=self.cookies,
-            )
+        client = self._get_client()
+        res = await client.request(
+            method="POST",
+            url=self.DOLIKE_URL,
+            timeout=10,
+            params={"g_tk": self.gtk2},
+            data=post_data,
+            headers={
+                "referer": "https://user.qzone.qq.com/" + str(self.uin),
+                "origin": "https://user.qzone.qq.com",
+            },
+            cookies=self.cookies,
+        )
         if res.status_code == 200:
             code = extract_code_json(res.text)
             self._check_login_code(code)
@@ -401,19 +475,20 @@ class QzoneAPI:
             "ref": "feeds",
             "content": content,
         }
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            res = await client.request(
-                method="POST",
-                url=self.COMMENT_URL,
-                params={"g_tk": self.gtk2},
-                data=post_data,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                    "referer": "https://user.qzone.qq.com/" + str(self.uin),
-                    "origin": "https://user.qzone.qq.com",
-                },
-                cookies=self.cookies,
-            )
+        client = self._get_client()
+        res = await client.request(
+            method="POST",
+            url=self.COMMENT_URL,
+            timeout=10,
+            params={"g_tk": self.gtk2},
+            data=post_data,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                "referer": "https://user.qzone.qq.com/" + str(self.uin),
+                "origin": "https://user.qzone.qq.com",
+            },
+            cookies=self.cookies,
+        )
         if res.status_code == 200:
             code = extract_code_html(res.text)
             self._check_login_code(code)
@@ -463,19 +538,20 @@ class QzoneAPI:
             "richval": "",
             "paramstr": "1",
         }
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            res = await client.request(
-                method="POST",
-                url=self.COMMENT_URL,
-                params={"g_tk": self.gtk2},
-                data=post_data,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-                    "referer": "https://user.qzone.qq.com/" + str(self.uin),
-                    "origin": "https://user.qzone.qq.com",
-                },
-                cookies=self.cookies,
-            )
+        client = self._get_client()
+        res = await client.request(
+            method="POST",
+            url=self.COMMENT_URL,
+            timeout=10,
+            params={"g_tk": self.gtk2},
+            data=post_data,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+                "referer": "https://user.qzone.qq.com/" + str(self.uin),
+                "origin": "https://user.qzone.qq.com",
+            },
+            cookies=self.cookies,
+        )
         if res.status_code == 200:
             code = extract_code_html(res.text)
             self._check_login_code(code)
@@ -493,6 +569,7 @@ class QzoneAPI:
 
         compress=True 时送 VLM 前压缩（长边 ≤max_edge + JPEG 质量 quality），
         降低 token 消耗与耗时；压缩失败（缺 Pillow/解码失败）回退原图。
+        图片 bytes 内部直传，只在送 VLM 边界做一次 base64 编码（省一次全量编解码）。
         """
         urls = [u for u in urls if u][:max_images]
         if not urls:
@@ -502,15 +579,18 @@ class QzoneAPI:
         async def describe(url: str):
             async with sem:
                 try:
-                    image_base64 = await self.get_image_base64_by_url(url, with_cookies=True)
-                    if not image_base64:
+                    # 缓存命中时无需下载（由 VisionManager 按 URL 判缓存）
+                    if image_manager.is_cached(url):
+                        return await image_manager.get_image_description(url, "")
+                    raw = await self._download_image_bytes(url, with_cookies=True)
+                    if not raw:
                         logger.warning(f"获取图片失败: {url}")
                         return "[图片（加载失败）]"
+                    payload = raw
                     if compress:
-                        raw = base64.b64decode(image_base64)
                         out = await asyncio.to_thread(compress_image_bytes, raw, max_edge, quality)
                         if out:
-                            image_base64 = base64.b64encode(out).decode("utf-8")
+                            payload = out
                             if len(out) < len(raw):
                                 logger.info(
                                     f"图片压缩 {len(raw) / 1024:.0f}KB → {len(out) / 1024:.0f}KB"
@@ -519,13 +599,16 @@ class QzoneAPI:
                             logger.warning(
                                 f"图片压缩失败，回退原图 {len(raw) / 1024:.0f}KB"
                                 f"（缺 Pillow 或解码失败，检查 manifest 依赖 pillow）")
-                    return await image_manager.get_image_description(image_base64)
+                    return await image_manager.get_image_description(
+                        url, base64.b64encode(payload).decode("utf-8"))
                 except Exception as e:
                     logger.warning(f"获取图片描述失败: {e}")
                     return "[图片（识别失败）]"
 
         results = await asyncio.gather(*[describe(u) for u in urls], return_exceptions=True)
-        return [r for r in results if isinstance(r, str)]
+        # 保序补占位：异常项（含 CancelledError 等 BaseException）不能静默丢弃，
+        # 否则结果条数变少、后续图片编号整体前移错位
+        return [r if isinstance(r, str) else "[图片（识别失败）]" for r in results]
 
     async def get_list(self, target_qq: str, num: int, filter: bool = True, describe_images: bool = True,
                        max_images: int = 9, image_concurrency: int = 3,
@@ -538,32 +621,33 @@ class QzoneAPI:
         compress / max_edge / quality：送 VLM 前压缩图片（省 token），失败回退原图。
         """
         logger.info(f"即将获取 {target_qq} 的说说列表...num={num} filter={filter}")
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            res = await client.request(
-                method="GET",
-                url=self.LIST_URL,
-                params={
-                    "g_tk": self.gtk2,
-                    "uin": target_qq,
-                    "ftype": 0,
-                    "sort": 0,
-                    "pos": 0,
-                    "num": num,
-                    "replynum": 100,
-                    "callback": "_preloadCallback",
-                    "code_version": 1,
-                    "format": "jsonp",
-                    "need_comment": 1,
-                    "need_private_comment": 1,
-                },
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                    "Referer": f"https://user.qzone.qq.com/{target_qq}",
-                    "Host": "user.qzone.qq.com",
-                    "Connection": "keep-alive",
-                },
-                cookies=self.cookies,
-            )
+        client = self._get_client()
+        res = await client.request(
+            method="GET",
+            url=self.LIST_URL,
+            timeout=10,
+            params={
+                "g_tk": self.gtk2,
+                "uin": target_qq,
+                "ftype": 0,
+                "sort": 0,
+                "pos": 0,
+                "num": num,
+                "replynum": 100,
+                "callback": "_preloadCallback",
+                "code_version": 1,
+                "format": "jsonp",
+                "need_comment": 1,
+                "need_private_comment": 1,
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Referer": f"https://user.qzone.qq.com/{target_qq}",
+                "Host": "user.qzone.qq.com",
+                "Connection": "keep-alive",
+            },
+            cookies=self.cookies,
+        )
 
         if res.status_code != 200:
             logger.error("访问失败: " + str(res.status_code))
@@ -628,7 +712,8 @@ class QzoneAPI:
             if describe_images:
                 urls = []
                 for pic in (msg.get("pic") or []):
-                    urls.append(pic.get("url1") or pic.get("pic_id") or pic.get("smallurl"))
+                    # VLM 只需小图：smallurl 优先（下载字节数比 url1 大图低 5~10 倍）
+                    urls.append(pic.get("smallurl") or pic.get("url1") or pic.get("pic_id"))
                 for video in (msg.get("video") or []):
                     urls.append(video.get("url1") or video.get("pic_url"))
                 images = await self._describe_images(urls, max_images, image_concurrency,
@@ -697,35 +782,36 @@ class QzoneAPI:
         describe_images=False 时跳过图片下载与VLM描述。
         compress / max_edge / quality：送 VLM 前压缩图片（省 token），失败回退原图。
         """
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            res = await client.request(
-                method="GET",
-                url=self.ZONE_LIST_URL,
-                params={
-                    "uin": self.uin,
-                    "scope": 0,
-                    "view": 1,
-                    "filter": "all",
-                    "flag": 1,
-                    "applist": "all",
-                    "pagenum": 1,
-                    "aisortEndTime": 0,
-                    "aisortOffset": 0,
-                    "aisortBeginTime": 0,
-                    "begintime": 0,
-                    "format": "json",
-                    "g_tk": self.gtk2,
-                    "useutf8": 1,
-                    "outputhtmlfeed": 1,
-                },
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                    "Referer": f"https://user.qzone.qq.com/{self.uin}",
-                    "Host": "user.qzone.qq.com",
-                    "Connection": "keep-alive",
-                },
-                cookies=self.cookies,
-            )
+        client = self._get_client()
+        res = await client.request(
+            method="GET",
+            url=self.ZONE_LIST_URL,
+            timeout=10,
+            params={
+                "uin": self.uin,
+                "scope": 0,
+                "view": 1,
+                "filter": "all",
+                "flag": 1,
+                "applist": "all",
+                "pagenum": 1,
+                "aisortEndTime": 0,
+                "aisortOffset": 0,
+                "aisortBeginTime": 0,
+                "begintime": 0,
+                "format": "json",
+                "g_tk": self.gtk2,
+                "useutf8": 1,
+                "outputhtmlfeed": 1,
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Referer": f"https://user.qzone.qq.com/{self.uin}",
+                "Host": "user.qzone.qq.com",
+                "Connection": "keep-alive",
+            },
+            cookies=self.cookies,
+        )
 
         if res.status_code != 200:
             logger.error("访问失败: " + str(res.status_code))
@@ -734,7 +820,9 @@ class QzoneAPI:
         data = res.text
         if data.startswith("_Callback(") and data.endswith(");"):
             data = data[len("_Callback("):-2]
-        data = data.replace("undefined", "null")
+        # 只在 JSON 结构位（:, [ { 之后 / , ] } 之前）替换 undefined，
+        # 避免全文替换把说说正文里的英文单词 undefined 改写成 null
+        data = re.sub(r"(?<=[:,\[])\s*undefined(?=\s*[,\]}])", "null", data)
         try:
             data_dict = json5.loads(data)
             if isinstance(data_dict, dict):
@@ -758,6 +846,9 @@ class QzoneAPI:
                 tid = feed.get("key", "")
                 if not target_qq or not tid:
                     logger.error(f"无效的说说数据: target_qq={target_qq}, tid={tid}")
+                    continue
+                # 提前过滤自己的说说（好友动态流不含自己），省 BS4 解析与图片下载
+                if str(target_qq) == str(self.uin):
                     continue
 
                 html_content = feed.get("html", "")
@@ -849,8 +940,6 @@ class QzoneAPI:
                 })
 
             logger.info(f"成功解析 {len(feeds_list)} 条最新说说")
-            # 去除自己的说说
-            feeds_list = [item for item in feeds_list if item.get("target_qq") != str(self.uin)]
             return feeds_list
         except Exception as e:
             logger.error(f"解析说说错误：{str(e)}")

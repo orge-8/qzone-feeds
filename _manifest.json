@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "org.orge-8.qzone-feeds",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "name": "QQ空间动态",
   "description": "发QQ动态、读好友动态、VLM识别动态配图、回复自己动态下的评论、定时自动读好友动态并点赞评论（自动任务带静默时段与概率控制）。所有命令需管理员鉴权，Cookie 通过 napcat-adapter 自动获取，全局限速串行队列防风控。",
   "author": {

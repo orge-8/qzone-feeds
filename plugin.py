@@ -2,14 +2,17 @@
 
 - 生命周期：on_load（注入/启动）/ on_unload（drain 队列 + cancel）/ on_config_update
 - 管理员鉴权：is_local_operator 放行 + admin_ids 白名单（'qq:123' / '123'）
-- 6 个 @Command：动态发 / 动态发图 / 好友动态 / 说说(读+赞评) / 回复评论 / 动态状态
+- 7 个 @Command：动态发 / 动态发图 / 好友动态 / 说说(读) / 说说互动(读+赞评) / 回复评论 / 动态状态
 - 串行队列：asyncio.Queue 单 worker，自动任务也走同一队列；cookie 失效自动重登
 - 任务级无总超时（网络请求自带超时）；命令侧等待结果有 queue_timeout_sec 保护
 """
 
 import asyncio
+import ipaddress
 import random
 import re
+import socket
+from urllib.parse import urlparse
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
 
@@ -94,6 +97,8 @@ class ReadConfig(PluginConfigBase):
     enable_image_compress: bool = Field(default=True, description="送VLM前压缩图片（省token/加速，关闭则用原图）")
     image_max_edge: int = Field(default=1024, description="压缩后长边像素上限（256~4096）")
     image_quality: int = Field(default=80, description="JPEG压缩质量 10~95")
+    enable_desc_cache: bool = Field(default=True, description="缓存图片VLM描述（同一图片URL不重复识别）")
+    desc_cache_size: int = Field(default=200, description="VLM描述缓存容量（LRU条数，重启清空）")
 
 
 class PublishConfig(PluginConfigBase):
@@ -153,6 +158,45 @@ class QzoneFeedsConfig(PluginConfigBase):
 
 # ===== 工具 =====
 _URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+
+def _is_public_ip(ip) -> bool:
+    """是否公网可路由地址（排除私有/回环/链路本地/保留/组播/未指定）。"""
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+async def _is_safe_image_url(url: str) -> bool:
+    """/动态发图 的用户可控地址做 SSRF 校验：拒绝内网、本机与云元数据地址。
+
+    主机名场景会先解析再逐条判定（防 DNS 指向内网的绕过）；解析失败一律拒绝。
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        if not host:
+            return False
+        try:
+            # 字面量 IP 直接判定
+            return _is_public_ip(ipaddress.ip_address(host))
+        except ValueError:
+            pass
+        # 主机名：解析后逐个判定（getaddrinfo 是阻塞调用，扔线程池）
+        try:
+            infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+        except Exception:
+            return False
+        if not infos:
+            return False
+        for info in infos:
+            try:
+                cand = ipaddress.ip_address(info[4][0])
+            except (ValueError, IndexError, TypeError):
+                continue
+            if not _is_public_ip(cand):
+                return False
+        return True
+    except Exception:
+        return False
 
 
 def _parse_qq_id(value) -> str:
@@ -254,6 +298,12 @@ class QzoneFeedsPlugin(MaiBotPlugin):
     async def on_unload(self):
         if self._auto_loop:
             await self._auto_loop.stop()
+        # 防抖挂起的已处理记录兜底落盘
+        if self._store is not None:
+            try:
+                await self._store.flush()
+            except Exception as e:
+                self.ctx.logger.error(f"卸载时已处理列表落盘失败: {e}")
         # 先 drain 队列中尚未执行的 job，回填失败结果（防止等待方永久挂起）
         if self._queue is not None:
             while True:
@@ -400,6 +450,12 @@ class QzoneFeedsPlugin(MaiBotPlugin):
             except Exception as e:
                 self.ctx.logger.error(f"任务回调失败: {e}")
             self._queue.task_done()
+            # job 边界落盘已处理列表（防抖累积的 dirty 数据在此兜底）
+            if self._store is not None:
+                try:
+                    await self._store.flush()
+                except Exception as e:
+                    self.ctx.logger.error(f"已处理列表落盘失败: {e}")
             if interrupted:
                 raise asyncio.CancelledError()
 
@@ -419,6 +475,12 @@ class QzoneFeedsPlugin(MaiBotPlugin):
                 last_err = e
                 self.ctx.logger.warning(f"登录态失效（第{attempt + 1}次），强制刷新 cookie 重试")
                 continue
+            finally:
+                # 关闭共享 httpx client（job 边界释放连接池）
+                try:
+                    await api.aclose()
+                except Exception:
+                    pass
         return {"ok": False, "msg": f"登录态失效且重登后仍失败: {last_err}"}
 
     async def _run_command_job(self, stream_id: str, run_fn):
@@ -446,6 +508,9 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         if not self._is_admin(kwargs):
             return await self._deny(stream_id)
         text = kwargs.get("matched_groups", {}).get("text", "").strip()
+        if not text:
+            await self.ctx.send.text("正文不能为空", stream_id)
+            return False, "正文为空", 1
         max_len = int(self.config.publish.max_text_length or 2000)
         if len(text) > max_len:
             await self.ctx.send.text(f"正文超长（{len(text)}/{max_len}）", stream_id)
@@ -476,6 +541,9 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         if not _URL_RE.match(image_url):
             await self.ctx.send.text("图片地址必须是 http(s) URL，格式：/动态发图 正文 | 图片URL", stream_id)
             return False, "图片URL不合法", 1
+        if not await _is_safe_image_url(image_url):
+            await self.ctx.send.text("图片地址指向内网或保留地址，已拒绝", stream_id)
+            return False, "图片URL不安全", 1
 
         async def run(api: QzoneAPI) -> dict:
             # 用户提供的任意 URL：不带 Qzone cookie 出站（防凭据外发）
