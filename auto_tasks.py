@@ -126,8 +126,21 @@ async def process_feeds(
             content += f"（转发: {feed['rt_con']}）"
         for img in (feed.get("images") or []):
             content += f"[图: {img}]"
+
+        # 可评论素材判定：正文/转发内容，或"非占位符"的图片描述。
+        # 纯占位符（[图片] / [图片（识别失败）]）不构成素材——等于什么都没告诉 LLM。
+        # 无素材必须跳过评论：空白输入会让 LLM 凭空发挥（真机实测：
+        # 转发动态抓不到原内容 → prompt 变成「好友X发了说说：。」→
+        # 产出「哈哈转发了个寂寞，原内容是啥呀」这类无意义评论）。
+        text_material = (str(feed.get("content", "") or "").strip()
+                         or str(feed.get("rt_con", "") or "").strip())
+        image_material = [d for d in (feed.get("images") or [])
+                          if d and not str(d).lstrip().startswith("[图片")]
+        has_material = bool(text_material or image_material)
+        if not has_material:
+            logger.info(f"跳过评论 {fid}：无可评论素材（正文/转发/图片描述均为空）")
         try:
-            if random.random() <= comment_probability:
+            if has_material and random.random() <= comment_probability:
                 prompt = comment_prompt_tpl.format(target_name=target_qq, content=content)
                 comment_text = sanitize_llm_output(await _llm_generate(plugin, prompt))
                 if comment_text:

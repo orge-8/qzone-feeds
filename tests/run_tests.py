@@ -521,6 +521,87 @@ def test_image_size_cap():
 
 
 # ============================================================
+# G. 评论素材守卫（真机回归：空内容不得评论）
+# ============================================================
+class _FakeStore:
+    def __init__(self):
+        self.seen = set()
+
+    async def is_processed(self, fid, tid=None):
+        return fid in self.seen
+
+    async def mark_processed(self, fid, tid=None):
+        self.seen.add(fid)
+        return True
+
+
+class _FakeApi:
+    def __init__(self):
+        self.comments = []
+        self.likes = []
+
+    async def comment(self, fid, qq, text):
+        self.comments.append(text)
+        return True
+
+    async def like(self, fid, qq):
+        self.likes.append(fid)
+        return True
+
+
+async def test_comment_material_guard():
+    """回归：无可评论素材（转发抓不到内容 / 纯占位图）时不得评论，点赞不受影响。"""
+    section("G. 评论素材守卫")
+    at = auto_tasks
+    orig_llm = at._llm_generate
+
+    async def fake_llm(plugin, prompt):
+        return "模拟评论"
+
+    at._llm_generate = fake_llm
+    try:
+        base = {"target_qq": "20001", "videos": [], "comments": []}
+
+        async def run(feed):
+            store, api = _FakeStore(), _FakeApi()
+            await at.process_feeds(None, api, store, [feed],
+                                   like_probability=1.0, comment_probability=1.0,
+                                   action_interval=0)
+            return api
+
+        api = await run({**base, "tid": "e1", "content": "", "rt_con": "", "images": []})
+        check("G01 无素材（空转发）不发评论", not api.comments,
+              f"却发了：{api.comments}" if api.comments else "已跳过")
+        check("G02 无素材时点赞仍执行", api.likes == ["e1"], f"likes={api.likes}")
+
+        api = await run({**base, "tid": "e2", "content": "", "rt_con": "", "images": ["[图片]"]})
+        check("G03 只有占位符图片不发评论", not api.comments,
+              f"却发了：{api.comments}" if api.comments else "已跳过")
+
+        api = await run({**base, "tid": "e3", "content": "今天天气真好", "rt_con": "", "images": []})
+        check("G04 有正文时正常评论", len(api.comments) == 1, f"评论数={len(api.comments)}")
+
+        api = await run({**base, "tid": "e4", "content": "", "rt_con": "原说说内容", "images": []})
+        check("G05 有转发内容时正常评论", len(api.comments) == 1, f"评论数={len(api.comments)}")
+
+        api = await run({**base, "tid": "e5", "content": "", "rt_con": "", "images": ["一只橘猫趴在键盘上"]})
+        check("G06 有真实图片描述时正常评论", len(api.comments) == 1, f"评论数={len(api.comments)}")
+
+        captured = {}
+
+        async def cap_llm(plugin, prompt):
+            captured["p"] = prompt
+            return "x"
+
+        at._llm_generate = cap_llm
+        await run({**base, "tid": "e6", "content": "有内容的动态", "rt_con": "", "images": []})
+        check("G07 有素材时 prompt 内容位非空",
+              "说说：有内容的动态" in captured.get("p", ""), captured.get("p", "")[:60])
+    finally:
+        at._llm_generate = orig_llm
+
+
+# ============================================================
 # F. 生命周期 / 队列
 # ============================================================
 async def test_lifecycle():
@@ -597,6 +678,7 @@ async def _amain():
     test_upload_response_parsing()
     await test_upload_bad_response()
     test_image_size_cap()
+    await test_comment_material_guard()
     await test_lifecycle()
     test_manifest()
 
