@@ -602,6 +602,96 @@ async def test_comment_material_guard():
 
 
 # ============================================================
+# H. 自动任务图片参数（回归：自动评论能"看到"动态配图）
+# ============================================================
+class _CfgSection:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _AutoCfg:
+    def __init__(self, **kw):
+        defaults = dict(enable_auto_read=True, enable_auto_reply=False,
+                        like_probability=0.9, comment_probability=0.6,
+                        action_interval_sec=0, comment_prompt="")
+        defaults.update(kw)
+        self.__dict__.update(defaults)
+
+
+class _ReadCfg:
+    def __init__(self, **kw):
+        defaults = dict(enable_image_description=True, max_images_per_feed=9,
+                        image_concurrency=3, enable_image_compress=True,
+                        image_max_edge=1024, image_quality=80)
+        defaults.update(kw)
+        self.__dict__.update(defaults)
+
+
+class _AutoPlugin:
+    def __init__(self, read_kw=None, auto_kw=None):
+        self.config = types.SimpleNamespace(
+            auto=_AutoCfg(**(auto_kw or {})),
+            read=_ReadCfg(**(read_kw or {})),
+            admin=_CfgSection(auto_read_blacklist=[]),
+        )
+
+
+class _AutoApi:
+    """mock QzoneAPI：记录 get_qzone_list 收到的图片参数，返回空列表。"""
+
+    def __init__(self):
+        self.calls = []
+
+    async def get_qzone_list(self, **kwargs):
+        self.calls.append(kwargs)
+        return []
+
+
+async def test_auto_job_vision_params():
+    """回归：自动任务读动态时的图片识别参数必须来自 [read] 配置。"""
+    section("H. 自动任务图片参数")
+    at = auto_tasks
+
+    # 1. 配置开启 → describe_images=True 且限额透传
+    p = _AutoPlugin(read_kw=dict(enable_image_description=True, max_images_per_feed=4,
+                                 image_concurrency=2, image_max_edge=768, image_quality=60))
+    api = _AutoApi()
+    await at.run_auto_job(p, api, _FakeStore(), None)
+    check("H01 自动任务尊重 read.enable_image_description=True",
+          api.calls and api.calls[0].get("describe_images") is True,
+          f"实际参数：{api.calls[0] if api.calls else '未调用'}")
+    check("H02 图片限额透传（max_images/concurrency/edge/quality）",
+          api.calls and api.calls[0].get("max_images") == 4
+          and api.calls[0].get("image_concurrency") == 2
+          and api.calls[0].get("max_edge") == 768
+          and api.calls[0].get("quality") == 60,
+          f"实际：{api.calls[0] if api.calls else '未调用'}")
+
+    # 2. 配置关闭 → describe_images=False（用户显式关掉 VLM）
+    p2 = _AutoPlugin(read_kw=dict(enable_image_description=False))
+    api2 = _AutoApi()
+    await at.run_auto_job(p2, api2, _FakeStore(), None)
+    check("H03 配置关闭时 describe_images=False",
+          api2.calls and api2.calls[0].get("describe_images") is False,
+          f"实际参数：{api2.calls[0] if api2.calls else '未调用'}")
+
+    # 3. 配置异常/不可读 → 保守降级为不识别（等价旧行为），不抛异常
+    broken_plugin = types.SimpleNamespace(
+        config=types.SimpleNamespace(auto=_AutoCfg(), read=None))
+    api3 = _AutoApi()
+    await at.run_auto_job(broken_plugin, api3, _FakeStore(), None)
+    check("H04 配置不可读时降级 describe_images=False 不抛异常",
+          api3.calls and api3.calls[0].get("describe_images") is False,
+          f"实际参数：{api3.calls[0] if api3.calls else '未调用'}")
+
+    # 4. 自动读关闭时不拉取
+    p4 = _AutoPlugin(auto_kw=dict(enable_auto_read=False))
+    api4 = _AutoApi()
+    await at.run_auto_job(p4, api4, _FakeStore(), None)
+    check("H05 enable_auto_read=False 时不拉动态", not api4.calls)
+
+
+# ============================================================
 # F. 生命周期 / 队列
 # ============================================================
 async def test_lifecycle():
@@ -629,6 +719,117 @@ async def test_lifecycle():
     check("F09 命令侧等待受 Host 60s 硬超时约束",
           plugin._HOST_COMMAND_TIMEOUT_SEC <= 60,
           f"={plugin._HOST_COMMAND_TIMEOUT_SEC}s")
+
+
+# ============================================================
+# I. LLM 任务名/模型名解析（MaiBot 1.2.5 语义拆分兼容）
+# ============================================================
+def test_resolve_llm_params():
+    section("I. LLM 任务名/模型名解析")
+    f = plugin.resolve_llm_params
+
+    # 1. 新语义：task + model 各走各的
+    check("I01 新配置：task_name 与 model 分传",
+          f("replyer", "", "gpt-4o") == {"task_name": "replyer", "model": "gpt-4o"},
+          repr(f("replyer", "", "gpt-4o")))
+
+    # 2. 旧配置迁移：task 空、legacy 非空 → legacy 是旧版任务名
+    check("I02 旧配置（text_model='replyer'）迁移为 task_name",
+          f("", "replyer", "") == {"task_name": "replyer"},
+          repr(f("", "replyer", "")))
+    check("I03 旧视觉配置（vision_model='vlm'）迁移为 task_name",
+          f("", "vlm", "") == {"task_name": "vlm"})
+
+    # 3. 全空 → 不传键，走 SDK 默认（task_name="utils" 由 SDK 塞入）
+    check("I04 全空时不传任何键", f("", "", "") == {}, repr(f("", "", "")))
+
+    # 4. task 显式设置时优先于 legacy（用户已迁移到新语义）
+    check("I05 task 优先于 legacy",
+          f("utils", "replyer", "") == {"task_name": "utils"})
+
+    # 5. 只有具体模型名（无任务名）→ 只传 model
+    check("I06 只有 model_name 时只传 model",
+          f("", "", "qwen-vl") == {"model": "qwen-vl"})
+
+    # 6. 空白与 None 容错
+    try:
+        r7 = f(None, "  ", None)
+        check("I07 None 输入不抛异常", isinstance(r7, dict), repr(r7))
+    except Exception as e:
+        check("I07 None 输入不抛异常", False, repr(e))
+
+
+async def test_resolve_llm_callers():
+    """I08~I10：调用侧（reply_manager / vision）的 kwargs 组装。"""
+    section("I. LLM 任务名/模型名解析（调用侧）")
+
+    class _LLMStub:
+        def __init__(self):
+            self.kwargs = None
+
+        async def generate(self, prompt, **kw):
+            self.kwargs = kw
+            return {"response": "ok"}
+
+    class _P:
+        resolve_llm_params = staticmethod(plugin.resolve_llm_params)
+
+        class config:
+            class plugin:
+                text_task = ""
+                text_model = "replyer"
+                text_model_name = ""
+
+        class ctx:
+            llm = _LLMStub()
+
+    p = _P()
+    out = await reply_manager._llm_generate(p, "hi")
+    check("I08 reply_manager 旧配置迁移后走 task_name=replyer",
+          p.ctx.llm.kwargs == {"task_name": "replyer"} and out == "ok",
+          f"kwargs={p.ctx.llm.kwargs}")
+
+    # vision 调用侧
+    class _VP:
+        resolve_llm_params = staticmethod(plugin.resolve_llm_params)
+
+        class config:
+            class read:
+                vision_task = ""
+                vision_model = "vlm"
+                vision_model_name = ""
+                enable_image_description = True
+
+        class ctx:
+            llm = _LLMStub()
+
+    vp = _VP()
+    vm = vision.VisionManager(vp)
+    desc = await vm.get_image_description("https://a/1.png", "iVBORw0KGgo=")
+    check("I09 vision 旧配置迁移后走 task_name=vlm",
+          vp.ctx.llm.kwargs == {"task_name": "vlm"} and desc != vision.PLACEHOLDER_FAILED,
+          f"kwargs={vp.ctx.llm.kwargs} desc={desc[:20]!r}")
+
+    # vision 双空 → 占位符（不调 LLM）
+    class _VPEmpty:
+        resolve_llm_params = staticmethod(plugin.resolve_llm_params)
+
+        class config:
+            class read:
+                vision_task = ""
+                vision_model = ""
+                vision_model_name = ""
+                enable_image_description = True
+
+        class ctx:
+            llm = _LLMStub()
+
+    ve = _VPEmpty()
+    vm2 = vision.VisionManager(ve)
+    desc2 = await vm2.get_image_description("https://a/2.png", "iVBORw0KGgo=")
+    check("I10 vision 任务/模型全空时返回占位符且不调 LLM",
+          desc2 == vision.PLACEHOLDER and ve.ctx.llm.kwargs is None,
+          f"desc={desc2!r} kwargs={ve.ctx.llm.kwargs}")
 
 
 def test_manifest():
@@ -679,7 +880,10 @@ async def _amain():
     await test_upload_bad_response()
     test_image_size_cap()
     await test_comment_material_guard()
+    await test_auto_job_vision_params()
     await test_lifecycle()
+    test_resolve_llm_params()
+    await test_resolve_llm_callers()
     test_manifest()
 
 

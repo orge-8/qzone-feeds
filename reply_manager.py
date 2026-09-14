@@ -59,15 +59,24 @@ def sanitize_llm_output(text, max_chars: int = _MAX_PUBLISH_CHARS) -> str:
 
 
 async def _llm_generate(plugin, prompt: str) -> str:
-    """调用 Host LLM，返回文本；失败返回空串。带总超时防 Host 端挂住卡死队列。"""
+    """调用 Host LLM，返回文本；失败返回空串。带总超时防 Host 端挂住卡死队列。
+
+    任务名/模型名经 plugin.resolve_llm_params 解析（兼容 MaiBot 1.2.5 的语义拆分），
+    失败日志同时打出 kwargs——只有 Host 错误文本时分不清名字是配置填的还是 SDK 默认值。
+    """
+    kwargs: dict = {}
     try:
-        model = ""
         try:
-            model = plugin.config.plugin.text_model
-        except AttributeError:
-            pass
+            cfg = plugin.config.plugin
+            kwargs = plugin.resolve_llm_params(
+                getattr(cfg, "text_task", ""),
+                getattr(cfg, "text_model", ""),
+                getattr(cfg, "text_model_name", ""),
+            )
+        except (AttributeError, RuntimeError):
+            kwargs = {}
         result = await asyncio.wait_for(
-            plugin.ctx.llm.generate(prompt, model=model),
+            plugin.ctx.llm.generate(prompt, **kwargs),
             timeout=60,
         )
         return str(result.get("response") or "").strip()
@@ -75,7 +84,7 @@ async def _llm_generate(plugin, prompt: str) -> str:
         logger.error("LLM 生成超时（>60s）")
         return ""
     except Exception as e:
-        logger.error(f"LLM 生成失败: {e}")
+        logger.error(f"LLM 生成失败: {e}（kwargs={kwargs!r}）")
         return ""
 
 

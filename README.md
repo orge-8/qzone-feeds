@@ -45,8 +45,15 @@ MaiBot 插件：发 QQ 动态、读好友动态、VLM 识别动态配图、回�
 [admin]
 admin_ids = ["qq:你的QQ号"]   # 必填，否则所有命令都会被拒
 
+[plugin]
+text_task = "replyer"         # LLM 任务名（MaiBot 1.2.5+：model_task_config 的键）
+text_model_name = ""          # 具体模型名（可选；留空用任务默认模型）
+                              # 旧版 text_model 字段仍兼容：其值会自动作为任务名迁移
+
 [read]
-vision_model = "vlm"          # 视觉模型任务名；留空则图片显示为 [图片]
+vision_task = "vlm"           # 视觉任务名（MaiBot 1.2.5+）；留空则图片显示为 [图片]
+vision_model_name = ""        # 视觉具体模型名（可选；留空用任务默认模型）
+                              # 旧版 vision_model 字段仍兼容：其值会自动作为任务名迁移
 max_images_per_feed = 9       # 单条动态最多识别几张图（QQ空间上限9，越多越耗时）
 image_concurrency = 3         # 图片识别并发数
 enable_image_compress = true  # 送 VLM 前压缩图片（省 token/加速；false=用原图）
@@ -88,6 +95,15 @@ processed_store.py   已处理记录（LRU 200 feeds / 100 comments，防抖批�
 - **凭据与出站防护**（v1.1.1）：
   - 读动态下载图片时，只对 QQ 图床域名（`.qzone.qq.com` / `.gtimg.cn` / `.qq.com`）携带 cookie；手动跟随重定向且**每一跳都重新校验域名**，防止 `p_skey` 被一条恶意 `<img src>` 或 302 带到第三方主机
   - `/动态发图` 的用户可控地址做 SSRF 校验（拒绝内网 / 回环 / 链路本地 / 保留网段，主机名解析后逐条判定），且该链路下载时不带 Qzone cookie
+- **自动评论能看到图了**（v1.2.0）：自动任务读好友动态时改为尊重 `[read] enable_image_description`
+  与图片限额（`max_images_per_feed` / `image_concurrency` / 压缩参数）——旧版写死
+  `describe_images=False`，自动评论完全"看不到"配图，只能凭正文发挥。担心耗时可用
+  `max_images_per_feed` 调低单条识别张数；配置不可读时保守降级为不识别（等价旧行为）。
+- **适配 MaiBot 1.2.5 的任务名/模型名拆分**（v1.2.1）：1.2.5 起 `llm.generate` 的 `model`
+  参数按**具体模型名**解释，任务名拆到新参数 `task_name`（SDK 2.8.1 默认 `utils`）。
+  本插件新增 `text_task` / `text_model_name` 与 `vision_task` / `vision_model_name` 字段；
+  旧配置（`text_model="replyer"`、`vision_model="vlm"` 存的是任务名）**无需改动**，
+  读取时自动迁移为任务名。LLM 失败日志会打出完整 kwargs 便于排查。
 - **性能优化**（v1.1.0）：
   - 共享 httpx 连接池：每个 job 内所有请求复用同一 AsyncClient（省 TCP+TLS 握手）
   - 已处理列表防抖落盘：mark 只改内存，2s 防抖批量写盘 + job 边界兜底（写盘次数降一个数量级）
@@ -106,12 +122,12 @@ processed_store.py   已处理记录（LRU 200 feeds / 100 comments，防抖批�
 ## 测试
 
 ```bash
-# 行为测试（90 项：逻辑 + 鉴权 + 命令正则 + 安全验证 + 生命周期/Manifest）
+# 行为测试（112 项：逻辑 + 鉴权 + 命令正则 + 安全验证 + 副作用守卫 + LLM参数解析 + 生命周期/Manifest）
 python tests/run_tests.py
 ```
 
 不依赖 MaiBot 与真实网络（maibot_sdk 用 stub 注入，出站请求用 `httpx.MockTransport` 拦截），
-可直接在插件目录下运行。上线前需 **90/90 全过**。
+可直接在插件目录下运行。上线前需 **112/112 全过**。
 
 ## 部署
 

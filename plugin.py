@@ -69,7 +69,16 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用插件")
     config_version: float = Field(default=1.0, description="配置版本号（Host 版本策略必填）")
-    text_model: str = Field(default="replyer", description="LLM任务名（replyer/utils等）")
+    text_task: str = Field(
+        default="replyer",
+        description="LLM 任务名（MaiBot 1.2.5+：model_task_config 的键，如 replyer/utils）")
+    text_model: str = Field(
+        default="",
+        description="[兼容旧版] 1.2.4- 此字段=任务名；1.2.5+ 语义=具体模型名。"
+                    "留空即可，旧配置的值会自动迁移到 text_task")
+    text_model_name: str = Field(
+        default="",
+        description="具体模型名（可选，model_config.toml [[models]] 中的 name；留空用任务默认模型）")
 
 
 class AdminConfig(PluginConfigBase):
@@ -91,7 +100,16 @@ class ReadConfig(PluginConfigBase):
     default_count: int = Field(default=5, description="默认读取条数")
     max_count: int = Field(default=15, description="单次读取上限")
     enable_image_description: bool = Field(default=True, description="是否启用图片VLM描述")
-    vision_model: str = Field(default="", description="视觉模型任务名，留空则显示[图片]占位符")
+    vision_task: str = Field(
+        default="",
+        description="视觉任务名（MaiBot 1.2.5+：model_task_config 的键）；留空则显示[图片]占位符")
+    vision_model: str = Field(
+        default="",
+        description="[兼容旧版] 1.2.4- 此字段=视觉任务名；1.2.5+ 语义=具体模型名。"
+                    "旧配置的值会自动迁移到 vision_task")
+    vision_model_name: str = Field(
+        default="",
+        description="视觉具体模型名（可选；留空用任务默认模型）")
     max_images_per_feed: int = Field(default=9, description="单条动态最多识别几张图（QQ空间单条上限9，越多越耗时）")
     image_concurrency: int = Field(default=3, description="图片识别并发数（VLM 单张常需 20s+）")
     enable_image_compress: bool = Field(default=True, description="送VLM前压缩图片（省token/加速，关闭则用原图）")
@@ -158,6 +176,33 @@ class QzoneFeedsConfig(PluginConfigBase):
 
 # ===== 工具 =====
 _URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+
+def resolve_llm_params(task: str, model: str, model_name: str) -> dict:
+    """把（任务名, 旧字段值, 新模型名字段）解析成 llm.generate 的 kwargs。
+
+    MaiBot 1.2.5 拆分了「任务名」与「具体模型名」两个命名空间（runtime-gotchas #47）：
+      - 1.2.4- ：generate(model=X) 的 X 按任务名解释，旧配置把任务名存在 *model 字段
+      - 1.2.5+ ：model=具体模型名，task_name=任务名（SDK 2.8.1 默认 task_name="utils"）
+
+    兼容策略：
+      - 新字段 task 非空 → 直接作为 task_name（用户已迁移到新语义）
+      - task 为空且旧字段 model 非空 → 视为旧版任务名迁移：进 task_name
+        （旧配置里存的 replyer/vlm 是任务名；1.2.5 下若当模型名用必然解析失败）
+      - model_name 独立透传，两代 SDK 都认 model 键（具体模型名）
+      - 全空 → 不传任何键，走 SDK 默认（task_name="utils"）
+    """
+    kwargs: dict = {}
+    task_name = str(task or "").strip()
+    legacy = str(model or "").strip()
+    concrete = str(model_name or "").strip()
+    if not task_name and legacy:
+        task_name = legacy  # 旧版任务名迁移
+    if task_name:
+        kwargs["task_name"] = task_name
+    if concrete:
+        kwargs["model"] = concrete
+    return kwargs
 
 
 def _is_public_ip(ip) -> bool:

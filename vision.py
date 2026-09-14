@@ -73,11 +73,17 @@ class VisionManager:
         self._plugin = plugin
         self._desc_cache: dict[str, str] = {}  # url -> 描述（插入序 LRU）
 
-    def _get_vision_model(self) -> str:
+    def _get_vision_params(self) -> dict:
+        """llm.generate 的任务名/模型名 kwargs（兼容 MaiBot 1.2.5 语义拆分）。"""
         try:
-            return str(self._plugin.config.read.vision_model or "").strip()
-        except AttributeError:
-            return ""
+            cfg = self._plugin.config.read
+            return self._plugin.resolve_llm_params(
+                getattr(cfg, "vision_task", ""),
+                getattr(cfg, "vision_model", ""),
+                getattr(cfg, "vision_model_name", ""),
+            )
+        except (AttributeError, RuntimeError):
+            return {}
 
     def _get_enabled(self) -> bool:
         try:
@@ -145,8 +151,9 @@ class VisionManager:
                 return cached
         if not self._get_enabled():
             return PLACEHOLDER
-        vision_model = self._get_vision_model()
-        if not vision_model:
+        llm_kwargs = self._get_vision_params()
+        if not llm_kwargs:
+            # 任务名与模型名都为空：无法识别（旧行为：vision_model 留空 → 占位符）
             return PLACEHOLDER
         if not image_base64:
             return PLACEHOLDER_FAILED
@@ -155,7 +162,7 @@ class VisionManager:
             result = await asyncio.wait_for(
                 ctx.llm.generate(
                     prompt=self._build_messages(image_base64),
-                    model=vision_model,
+                    **llm_kwargs,
                 ),
                 timeout=DESC_TIMEOUT_SEC,
             )
@@ -163,7 +170,7 @@ class VisionManager:
             logger.warning(f"图片描述生成超时（>{DESC_TIMEOUT_SEC}s）")
             return PLACEHOLDER_FAILED
         except Exception as e:
-            logger.warning(f"图片描述生成失败: {e}")
+            logger.warning(f"图片描述生成失败: {e}（kwargs={llm_kwargs!r}）")
             return PLACEHOLDER_FAILED
 
         if not isinstance(result, dict):
@@ -175,7 +182,7 @@ class VisionManager:
             return PLACEHOLDER_FAILED
         if len(description) > MAX_DESC_CHARS:
             description = description[:MAX_DESC_CHARS]
-        logger.info(f"图片描述生成成功（模型={vision_model}，长度={len(description)}）")
+        logger.info(f"图片描述生成成功（kwargs={llm_kwargs}，长度={len(description)}）")
         if url:
             self._cache_put(url, description)
         return description

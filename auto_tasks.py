@@ -164,6 +164,31 @@ async def process_feeds(
     return stats
 
 
+def _auto_vision_params(plugin) -> tuple[bool, int, int, bool, int, int]:
+    """自动任务读好友动态时的图片识别参数（与命令侧同语义、同兜底值）。
+
+    Returns:
+        (describe_images, max_images, image_concurrency, compress, max_edge, quality)
+    """
+    # read 段整体不可读（未加载/热重载间隙）→ 保守降级为不识别（等价旧行为）
+    try:
+        read_cfg = plugin.config.read
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False, 9, 3, True, 1024, 80
+    if read_cfg is None:
+        return False, 9, 3, True, 1024, 80
+    try:
+        describe = bool(getattr(read_cfg, "enable_image_description", True))
+        max_images = max(0, int(getattr(read_cfg, "max_images_per_feed", 9) or 9))
+        concurrency = max(1, int(getattr(read_cfg, "image_concurrency", 3) or 3))
+        compress = bool(getattr(read_cfg, "enable_image_compress", True))
+        max_edge = max(256, min(int(getattr(read_cfg, "image_max_edge", 1024) or 1024), 4096))
+        quality = max(10, min(int(getattr(read_cfg, "image_quality", 80) or 80), 95))
+        return describe, max_images, concurrency, compress, max_edge, quality
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False, 9, 3, True, 1024, 80
+
+
 async def run_auto_job(plugin, api, store, reply_manager) -> dict:
     """自动任务主体（在队列 worker 中执行）：读好友动态+点赞/评论 + 回复新评论。
 
@@ -176,7 +201,12 @@ async def run_auto_job(plugin, api, store, reply_manager) -> dict:
     # ===== 1. 自动读好友动态并点赞/评论 =====
     if bool(getattr(cfg, "enable_auto_read", False)):
         try:
-            feeds_list = await api.get_qzone_list(describe_images=False)
+            # 图片描述参数尊重 [read] 配置（旧版写死 describe_images=False，
+            # 导致自动评论完全"看不到"动态配图，只能凭正文发挥）
+            (describe, max_img, conc, comp, edge, q) = _auto_vision_params(plugin)
+            feeds_list = await api.get_qzone_list(
+                describe_images=describe, max_images=max_img, image_concurrency=conc,
+                compress=comp, max_edge=edge, quality=q)
             if (isinstance(feeds_list, list) and feeds_list
                     and isinstance(feeds_list[0], dict) and feeds_list[0].get("error")):
                 summary_parts.append(f"读好友动态失败: {feeds_list[0]['error']}")
