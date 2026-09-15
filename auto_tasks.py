@@ -121,14 +121,11 @@ async def process_feeds(
             continue
         stats["handled"] += 1
         await asyncio.sleep(action_interval + random.random())
-        content = feed.get("content", "")
-        if feed.get("rt_con"):
-            content += f"（转发: {feed['rt_con']}）"
-        for img in (feed.get("images") or []):
-            content += f"[图: {img}]"
 
         # 可评论素材判定：正文/转发内容，或"非占位符"的图片描述。
-        # 纯占位符（[图片] / [图片（识别失败）]）不构成素材——等于什么都没告诉 LLM。
+        # 占位符（[图片] / [图片（识别失败）] / [图片（加载失败）]）既不构成素材，
+        # 也**不进 prompt**——真机实测把它写进内容后，LLM 会公开评论
+        # 「图裂了求补图」，等于把自身的取图故障当成对作者的吐槽。
         # 无素材必须跳过评论：空白输入会让 LLM 凭空发挥（真机实测：
         # 转发动态抓不到原内容 → prompt 变成「好友X发了说说：。」→
         # 产出「哈哈转发了个寂寞，原内容是啥呀」这类无意义评论）。
@@ -139,6 +136,16 @@ async def process_feeds(
         has_material = bool(text_material or image_material)
         if not has_material:
             logger.info(f"跳过评论 {fid}：无可评论素材（正文/转发/图片描述均为空）")
+
+        # 只把真实存在的素材拼进 prompt（占位符一律剔除）
+        content = str(feed.get("content", "") or "")
+        if str(feed.get("rt_con", "") or "").strip():
+            content += f"（转发: {feed['rt_con']}）"
+        for desc in image_material:
+            content += f"[图: {desc}]"
+        dropped = len(feed.get("images") or []) - len(image_material)
+        if dropped > 0:
+            logger.info(f"说说 {fid} 有 {dropped} 张图未获得有效描述，已从评论素材中剔除")
         try:
             if has_material and random.random() <= comment_probability:
                 prompt = comment_prompt_tpl.format(target_name=target_qq, content=content)
