@@ -54,6 +54,10 @@ class NoImageManager:
     def is_cached(self, url: str) -> bool:
         return False
 
+    def is_available(self) -> bool:
+        """未注入真实管理器 → 无法描述，调用方应跳过下载。"""
+        return False
+
 
 image_manager: Any = NoImageManager()
 
@@ -588,6 +592,16 @@ class QzoneAPI:
         urls = [u for u in urls if u][:max_images]
         if not urls:
             return []
+        # 前置短路：视觉链路不可用（未配 vision_task / 已关闭）时直接返回占位符，
+        # 不下载、不压缩——否则每轮都在为"注定拿不到描述"的图片白费流量与 CPU
+        # （真机实测：6 张图全部下载+压缩完，才在 get_image_description 里发现没配模型）。
+        try:
+            available = image_manager.is_available()
+        except AttributeError:
+            available = True  # 自定义管理器未实现该接口时按可用处理（保持向后兼容）
+        if not available:
+            logger.info(f"视觉描述不可用（未配置 vision_task 或已关闭），跳过 {len(urls)} 张图的下载与识别")
+            return ["[图片]"] * len(urls)
         sem = asyncio.Semaphore(max(1, concurrency))
 
         async def describe(url: str):

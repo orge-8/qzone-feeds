@@ -40,12 +40,57 @@ _MAX_PUBLISH_CHARS = 100
 # markdown 装饰符（LLM 输出有时带 **bold**、`code` 等，说说里是乱码）
 _MARKDOWN_RE = re.compile(r"[*_`#>~]+")
 
+# LLM 拒答/元回复特征词。
+# 这类文本是模型在对**我们**说话（拒绝执行创作要求），不是给好友的评论；
+# 一旦发布出去就变成"bot 公开教训好友"。真机事故：
+#   好友动态「一年之后，阿哈将成为路边一坨」→ bot 评论
+#   「你的描述中存在不文明且不恰当的表述……因此我不能按照你的要求进行创作」
+# 只要命中就判为拒答，直接跳过评论（fail-closed）。
+_REFUSAL_MARKERS = (
+    "按照你的要求",
+    "不能按照",
+    "无法按照",
+    "不符合健康",
+    "不文明",
+    "不恰当的表述",
+    "不当的表述",
+    "健康的交流规范",
+    "友善的语言",
+    "请使用文明",
+    "我不能提供",
+    "无法提供",
+    "我无法完成",
+    "我不能完成",
+    "作为人工智能",
+    "作为AI",
+    "作为一个AI",
+    "作为语言模型",
+    "作为大模型",
+    "换个话题",
+    "抱歉，我不能",
+    "抱歉,我不能",
+)
+
+
+def looks_like_refusal(text: str) -> bool:
+    """文本是否为 LLM 的拒答/元回复（而非对好友说的话）。
+
+    宁可漏判也不误判？不——这里反过来：拒答文本发布出去是**公开事故**，
+    误判（把正常评论当拒答而少发一条）只是少一次互动。
+    因此采用较宽的特征命中策略。
+    """
+    if not text:
+        return False
+    t = str(text)
+    return any(m in t for m in _REFUSAL_MARKERS)
+
 
 def sanitize_llm_output(text, max_chars: int = _MAX_PUBLISH_CHARS) -> str:
     """LLM 输出发布前净化：剥引号包裹、去 markdown 装饰、硬截断。
 
     防护目标：好友可在动态/评论内容里注入指令（间接 prompt injection），
     净化保证最终发布到 QQ 空间的文本短、纯、无装饰。
+    注意：本函数**不判断**拒答，调用方需另用 looks_like_refusal() 拦截。
     """
     if not text:
         return ""
@@ -199,6 +244,11 @@ class ReplyManager:
                     if not reply_message:
                         # 空回复也标记已处理，避免下一轮对同一评论无限重试
                         logger.warning("LLM 回复内容为空，标记已处理并跳过")
+                        await self._store.mark_processed(fid, comment["comment_tid"])
+                        continue
+                    if looks_like_refusal(reply_message):
+                        # 拒答文本绝不能发布（会变成 bot 公开教训好友）
+                        logger.warning(f"LLM 返回拒答内容，已跳过回复: {reply_message[:50]}")
                         await self._store.mark_processed(fid, comment["comment_tid"])
                         continue
                     result = await api.reply(
