@@ -155,8 +155,17 @@ class CookieExpiredError(Exception):
 # 图片下载上限：防恶意大文件/超大图撑爆内存（base64 展开再放大 1.33 倍）
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
-# 允许携带 Qzone cookie 下载图片的域名后缀（防凭据外发到第三方主机）
-_QZONE_IMAGE_HOST_SUFFIXES = (".qzone.qq.com", ".qzonestyle.gtimg.cn", ".gtimg.cn", ".qq.com")
+# 允许携带 Qzone cookie 下载图片的域名后缀（防凭据外发到第三方主机）。
+# 注意：白名单只决定"要不要带 cookie"，不在名单的域名仍会**不带 cookie** 尝试下载。
+# .qpic.cn 是腾讯图片 CDN 主力（m.qpic.cn / a.qpic.cn / p.qpic.cn），QQ空间配图大量走它，
+# 漏配会导致正常配图全部下载失败（VLM 描述变成"加载失败"）。
+_QZONE_IMAGE_HOST_SUFFIXES = (
+    ".qzone.qq.com",
+    ".qzonestyle.gtimg.cn",
+    ".gtimg.cn",
+    ".qpic.cn",
+    ".qq.com",
+)
 # 图片下载最多跟随几次重定向（每跳都要重新校验域名白名单）
 _MAX_REDIRECT_HOPS = 3
 _REDIRECT_STATUS = (301, 302, 303, 307, 308)
@@ -226,24 +235,28 @@ class QzoneAPI:
         """下载图片返回 bytes（流式 + 大小上限）。
 
         with_cookies=True（默认）：Qzone 相册图床需要登录态，带 cookies 防 403。
+          但**仅在域名属于 QQ 图床白名单时才带**；不在白名单则降级为不带 cookie 下载
+          （白名单只决定"要不要带凭据"，不该决定"能不能下载"——
+          一律拒绝会误杀正常配图，真机表现为 VLM 描述全成"加载失败"）。
         with_cookies=False：用户提供的任意 URL（如 /动态发图 的图片地址）——
         绝不携带 Qzone cookie 出站，防止凭据外发到第三方服务器。
         """
         if not url:
             return None
-        # 携带 cookie 出站前先校验域名：图片 URL 来自远端，不可信
-        if with_cookies and not _is_allowed_image_host(url):
-            logger.warning(f"图片域名不在图床白名单，已拒绝携带 cookie 下载: {url}")
-            return None
+        # 携带 cookie 前先校验域名：图片 URL 来自远端，不可信。
+        # 不在白名单 → 不拒绝请求，只是不带 cookie（防凭据外发，同时不误杀配图）。
+        send_cookies = bool(with_cookies) and _is_allowed_image_host(url)
+        if with_cookies and not send_cookies:
+            logger.info(f"图片域名不在图床白名单，改为不带 cookie 下载: {url}")
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Referer": "https://qzone.qq.com/",
         }
-        cookies = self.cookies if with_cookies else None
+        cookies = self.cookies if send_cookies else None
         try:
             client = self._get_client()
             # 流式下载 + 大小上限：Content-Length 预检 + 累计截断
-            # 手动跟随重定向（follow_redirects=False）：每一跳都重新校验域名白名单，
+            # 手动跟随重定向（follow_redirects=False）：带 cookie 时每一跳都重新校验域名，
             # 否则一条 302 就能把 cookie 带出白名单之外
             current = url
             for _hop in range(_MAX_REDIRECT_HOPS + 1):
@@ -255,7 +268,8 @@ class QzoneAPI:
                             logger.warning(f"重定向缺少 Location 头: {current}")
                             return None
                         nxt = str(httpx.URL(current).join(loc))
-                        if with_cookies and not _is_allowed_image_host(nxt):
+                        # 已带 cookie 时跨域跳转属异常（Qzone 图床不会跳到第三方），保守中止
+                        if send_cookies and not _is_allowed_image_host(nxt):
                             logger.warning(f"重定向目标不在图床白名单，中止下载（防凭据外发）: {nxt}")
                             return None
                         current = nxt
@@ -607,8 +621,19 @@ class QzoneAPI:
 
         results = await asyncio.gather(*[describe(u) for u in urls], return_exceptions=True)
         # 保序补占位：异常项（含 CancelledError 等 BaseException）不能静默丢弃，
-        # 否则结果条数变少、后续图片编号整体前移错位
-        return [r if isinstance(r, str) else "[图片（识别失败）]" for r in results]
+        # 否则结果条数变少、后续图片编号整体前移错位。
+        # 同时把"为什么没拿到有效描述"打出来——占位符本身会被上层剔除出评论素材，
+        # 若不打日志，这类失败在真机日志里完全是隐形的。
+        out: list[str] = []
+        for u, r in zip(urls, results):
+            if isinstance(r, str):
+                if r.lstrip().startswith("[图片"):
+                    logger.warning(f"图片未获得有效描述（已剔除出素材）: {r} <- {u}")
+                out.append(r)
+            else:
+                logger.warning(f"图片描述任务异常（已剔除出素材）: {u} - {r!r}")
+                out.append("[图片（识别失败）]")
+        return out
 
     async def get_list(self, target_qq: str, num: int, filter: bool = True, describe_images: bool = True,
                        max_images: int = 9, image_concurrency: int = 3,

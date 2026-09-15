@@ -832,6 +832,191 @@ async def test_resolve_llm_callers():
           f"desc={desc2!r} kwargs={ve.ctx.llm.kwargs}")
 
 
+# ============================================================
+# J. 图床白名单「降级而非拒绝」（v1.2.2 回归：配图被误杀）
+# ============================================================
+async def test_image_host_downgrade():
+    section("J. 图床白名单降级")
+    import httpx
+
+    # J01 白名单覆盖腾讯图片 CDN 主力 qpic.cn
+    qpic_hosts = [
+        "https://m.qpic.cn/psc?/V53abc/abc.jpg",
+        "https://a.qpic.cn/psc?/V53abc/abc.jpg",
+        "https://p.qpic.cn/psc?/abc.jpg",
+    ]
+    ok = [h for h in qpic_hosts if qzone_api._is_allowed_image_host(h)]
+    check("J01 白名单覆盖 .qpic.cn 家族", len(ok) == len(qpic_hosts),
+          f"覆盖 {len(ok)}/{len(qpic_hosts)}")
+
+    check("J02 白名单仍拒绝第三方域名",
+          qzone_api._is_allowed_image_host("https://evil.example.com/a.png") is False)
+
+    seen = {}
+
+    async def handler(request):
+        seen["cookie"] = request.headers.get("cookie", "")
+        seen["host"] = request.url.host
+        return httpx.Response(200, content=b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+
+    # J03 白名单内 qpic 域名 → 带 cookie 下载成功
+    api = qzone_api.QzoneAPI({"uin": "10001", "p_skey": "SUPERSECRET_PSKEY"})
+    api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    got = await api._download_image_bytes("https://m.qpic.cn/psc?/abc.jpg", with_cookies=True)
+    check("J03 白名单内 qpic 域名带 cookie 下载成功",
+          got is not None and "SUPERSECRET_PSKEY" in seen.get("cookie", ""),
+          f"bytes={len(got) if got else None}")
+
+    # J04 真正的第三方域名：降级为不带 cookie，但**仍然下载**（不再误杀）
+    seen.clear()
+    got2 = await api._download_image_bytes("https://cdn.thirdparty.example/x.jpg", with_cookies=True)
+    await api.aclose()
+    check("J04 非白名单域名降级为不带 cookie 且仍能下载（不再误杀）",
+          got2 is not None and len(got2) > 0 and "SUPERSECRET_PSKEY" not in seen.get("cookie", ""),
+          f"bytes={len(got2) if got2 else None} cookie={seen.get('cookie', '')!r}")
+
+    # J05 用户可控 URL（/动态发图）仍然绝不带 cookie
+    seen.clear()
+    api2 = qzone_api.QzoneAPI({"uin": "10001", "p_skey": "SUPERSECRET_PSKEY"})
+    api2._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await api2._download_image_bytes("https://any.example.com/x.jpg", with_cookies=False)
+    await api2.aclose()
+    check("J05 with_cookies=False 时不带 cookie",
+          "SUPERSECRET_PSKEY" not in seen.get("cookie", ""),
+          f"cookie={seen.get('cookie', '')!r}")
+
+
+async def test_failure_markers_excluded():
+    """J06~J09：图片加载失败标记不得进入评论 prompt。"""
+    section("J. 失败标记不进 prompt")
+    at = auto_tasks
+    orig = at._llm_generate
+    captured = {}
+
+    async def cap_llm(plugin, prompt):
+        captured["p"] = prompt
+        return "模拟评论"
+
+    at._llm_generate = cap_llm
+    try:
+        base = {"target_qq": "20001", "videos": [], "comments": []}
+
+        async def run(feed):
+            store, api = _FakeStore(), _FakeApi()
+            captured.clear()
+            await at.process_feeds(None, api, store, [feed],
+                                   like_probability=0.0, comment_probability=1.0,
+                                   action_interval=0)
+            return api
+
+        api = await run({**base, "tid": "f1", "content": "五维介质新企划",
+                         "rt_con": "", "images": ["[图片（加载失败）]"] * 9})
+        p = captured.get("p", "")
+        check("J06 加载失败标记不进 prompt",
+              "加载失败" not in p and "识别失败" not in p, f"prompt={p[:60]!r}")
+        check("J07 有正文时仍正常评论（不因图挂而跳过）",
+              len(api.comments) == 1, f"评论数={len(api.comments)}")
+
+        api = await run({**base, "tid": "f2", "content": "",
+                         "rt_con": "", "images": ["[图片（加载失败）]"] * 9})
+        check("J08 纯图且全失败时跳过评论",
+              not api.comments, f"却发了：{api.comments}" if api.comments else "已跳过")
+
+        api = await run({**base, "tid": "f3", "content": "",
+                         "rt_con": "", "images": ["九位角色立绘合影"]})
+        check("J09 真实图片描述进入 prompt",
+              "[图: 九位角色立绘合影]" in captured.get("p", "") and len(api.comments) == 1,
+              f"prompt={captured.get('p', '')[:70]!r}")
+    finally:
+        at._llm_generate = orig
+
+
+# ============================================================
+# K. 取图失败必须可诊断（真机日志里不能是隐形的）
+# ============================================================
+class _CapLogger:
+    def __init__(self):
+        self.msgs = []
+
+    def info(self, m):
+        self.msgs.append(str(m))
+
+    def warning(self, m):
+        self.msgs.append(str(m))
+
+    def error(self, m):
+        self.msgs.append(str(m))
+
+    def debug(self, m):
+        self.msgs.append(str(m))
+
+    def text(self):
+        return "\n".join(self.msgs)
+
+
+async def test_image_failure_diagnostics():
+    """K01~K02：占位符/失败必须留下可定位的日志。"""
+    section("K. 取图失败可诊断")
+    import httpx
+
+    cap = _CapLogger()
+    orig_qlog = qzone_api.logger
+    prev_mgr = qzone_api.image_manager
+    qzone_api.set_qzoneapi_logger(cap)
+    try:
+        async def handler(request):
+            return httpx.Response(200, content=b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+
+        class _PlaceholderMgr:
+            def is_cached(self, url):
+                return False
+
+            async def get_image_description(self, url, b64):
+                return "[图片]"
+
+        qzone_api.set_image_manager(_PlaceholderMgr())
+        api = qzone_api.QzoneAPI({"uin": "1", "p_skey": "x"})
+        api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        res = await api._describe_images(["https://m.qpic.cn/a.jpg"], 9, 3, compress=False)
+        await api.aclose()
+        check("K01 占位符描述打出 URL 诊断日志",
+              res == ["[图片]"] and "m.qpic.cn/a.jpg" in cap.text(),
+              repr(cap.text()[-90:]))
+    finally:
+        qzone_api.set_image_manager(prev_mgr)
+        qzone_api.set_qzoneapi_logger(orig_qlog)
+
+    # K02 视觉任务/模型双空时必须提示配置
+    cap2 = _CapLogger()
+    orig_vlog = vision.logger
+    vision.set_vision_logger(cap2)
+    try:
+        class _VP:
+            def resolve_llm_params(self, task, model, model_name):
+                return {}
+
+            class config:
+                class read:
+                    vision_task = ""
+                    vision_model = ""
+                    vision_model_name = ""
+                    enable_image_description = True
+
+            class ctx:
+                class llm:
+                    @staticmethod
+                    async def generate(prompt, **kw):
+                        return {"response": "x"}
+
+        vm = vision.VisionManager(_VP())
+        d = await vm.get_image_description("https://m.qpic.cn/a.jpg", "iVBORw0KGgo=")
+        check("K02 视觉双空时打出配置提示日志",
+              d == vision.PLACEHOLDER and "vision_task" in cap2.text(),
+              repr(cap2.text()[:90]))
+    finally:
+        vision.set_vision_logger(orig_vlog)
+
+
 def test_manifest():
     section("F. Manifest")
     m = json.loads((Path(PLUGIN_DIR) / "_manifest.json").read_text(encoding="utf-8"))
@@ -884,6 +1069,9 @@ async def _amain():
     await test_lifecycle()
     test_resolve_llm_params()
     await test_resolve_llm_callers()
+    await test_image_host_downgrade()
+    await test_failure_markers_excluded()
+    await test_image_failure_diagnostics()
     test_manifest()
 
 

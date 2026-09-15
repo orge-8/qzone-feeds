@@ -153,7 +153,9 @@ class VisionManager:
             return PLACEHOLDER
         llm_kwargs = self._get_vision_params()
         if not llm_kwargs:
-            # 任务名与模型名都为空：无法识别（旧行为：vision_model 留空 → 占位符）
+            # 任务名与模型名都为空：无法识别（旧行为：vision_model 留空 → 占位符）。
+            # 必须打日志——否则表现为"图片都在、描述却全是[图片]"，且日志里毫无线索。
+            logger.warning("视觉任务名与模型名均为空，未调用 VLM（请配置 [read] vision_task）")
             return PLACEHOLDER
         if not image_base64:
             return PLACEHOLDER_FAILED
