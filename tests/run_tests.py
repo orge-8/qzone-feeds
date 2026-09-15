@@ -1017,6 +1017,195 @@ async def test_image_failure_diagnostics():
         vision.set_vision_logger(orig_vlog)
 
 
+# ============================================================
+# L. 视觉不可用时零下载（省流量/CPU）
+# ============================================================
+async def test_skip_download_when_vision_unavailable():
+    section("L. 视觉不可用不下载")
+    import httpx
+
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        return httpx.Response(200, content=b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+
+    class _UnavailableMgr:
+        def is_cached(self, url):
+            return False
+
+        def is_available(self):
+            return False
+
+        async def get_image_description(self, url, b64):
+            return "[图片]"
+
+    prev = qzone_api.image_manager
+    qzone_api.set_image_manager(_UnavailableMgr())
+    try:
+        api = qzone_api.QzoneAPI({"uin": "1", "p_skey": "x"})
+        api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        urls = [f"https://a1.qpic.cn/psc?/{i}.jpg" for i in range(6)]
+        res = await api._describe_images(urls, 9, 3, compress=True)
+        await api.aclose()
+        check("L01 视觉不可用时返回占位符", res == ["[图片]"] * 6, f"len={len(res)}")
+        check("L02 视觉不可用时零下载（省流量/CPU）",
+              calls["n"] == 0, f"实际请求数={calls['n']}")
+    finally:
+        qzone_api.set_image_manager(prev)
+
+    # L03 可用时正常下载（不误伤）
+    calls["n"] = 0
+
+    class _AvailableMgr:
+        def is_cached(self, url):
+            return False
+
+        def is_available(self):
+            return True
+
+        async def get_image_description(self, url, b64):
+            return "一只猫"
+
+    prev2 = qzone_api.image_manager
+    qzone_api.set_image_manager(_AvailableMgr())
+    try:
+        api = qzone_api.QzoneAPI({"uin": "1", "p_skey": "x"})
+        api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        res = await api._describe_images(["https://a1.qpic.cn/psc?/0.jpg"], 9, 3, compress=False)
+        await api.aclose()
+        check("L03 视觉可用时正常下载并描述",
+              res == ["一只猫"] and calls["n"] == 1, f"res={res} 请求数={calls['n']}")
+    finally:
+        qzone_api.set_image_manager(prev2)
+
+    # L04~L06 VisionManager.is_available 语义
+    def _mk(task, enabled=True):
+        class _VP:
+            def resolve_llm_params(self, a, b, c):
+                return {"task_name": task} if task else {}
+
+            class config:
+                class read:
+                    vision_task = task
+                    vision_model = ""
+                    vision_model_name = ""
+                    enable_image_description = enabled
+
+        return vision.VisionManager(_VP())
+
+    check("L04 未配置视觉时 is_available()=False", _mk("").is_available() is False)
+    check("L05 已配置视觉时 is_available()=True", _mk("vlm").is_available() is True)
+    check("L06 开关关闭时 is_available()=False", _mk("vlm", False).is_available() is False)
+
+
+# ============================================================
+# M. 拒答拦截（真机事故：拒答文本被发布成评论）
+# ============================================================
+_REFUSAL_SAMPLE = ("你的描述中存在不文明且不恰当的表述，不符合健康的交流规范，"
+                   "因此我不能按照你的要求进行创作。我们应当使用文明、友善的语言进行沟通。")
+
+
+def test_refusal_detection():
+    section("M. 拒答拦截")
+    f = reply_manager.looks_like_refusal
+
+    check("M01 真机拒答原样命中", f(_REFUSAL_SAMPLE) is True)
+    check("M02 空文本不误判", f("") is False and f(None) is False)
+
+    ok_samples = [
+        "哈哈咋了这是？被队友气到不想碰王者啦？",
+        "狠狠共情！这段关于找寻自己的话真的超戳人",
+        "咋了呀宝？谁惹你生气啦，快跟我唠唠消消气！",
+        "这图也太好看了吧，求出处！",
+        "一年之后阿哈确实要变路边一坨了哈哈",
+    ]
+    bad = [s for s in ok_samples if f(s)]
+    check("M03 正常评论不误判", not bad, f"误判：{bad}" if bad else "全部正常")
+
+    # 单特征命中
+    for i, s in enumerate(["我不能提供这个帮助", "作为AI我无法完成该请求",
+                           "请使用文明用语", "换个话题吧"], 1):
+        if not f(s):
+            check(f"M04-{i} 单特征命中: {s}", False, "未命中")
+            break
+    else:
+        check("M04 拒答特征单点命中（4/4）", True)
+
+
+async def test_refusal_not_published():
+    """M05~M07：拒答文本不得产生评论/回复副作用。"""
+    section("M. 拒答不发布")
+    at = auto_tasks
+    orig = at._llm_generate
+
+    async def refusal_llm(plugin, prompt):
+        return _REFUSAL_SAMPLE
+
+    at._llm_generate = refusal_llm
+    try:
+        base = {"target_qq": "20001", "videos": [], "comments": []}
+        store, api = _FakeStore(), _FakeApi()
+        await at.process_feeds(None, api, store,
+                               [{**base, "tid": "r1", "content": "一年之后，阿哈将成为路边一坨",
+                                 "rt_con": "", "images": []}],
+                               like_probability=1.0, comment_probability=1.0,
+                               action_interval=0)
+        check("M05 拒答时不发评论", not api.comments,
+              f"却发了：{api.comments[:1]}" if api.comments else "已拦截")
+        check("M06 拒答时点赞仍执行", api.likes == ["r1"], f"likes={api.likes}")
+    finally:
+        at._llm_generate = orig
+
+    # M07 回评路径同样拦截
+    orig2 = reply_manager._llm_generate
+
+    async def refusal_llm2(plugin, prompt):
+        return _REFUSAL_SAMPLE
+
+    reply_manager._llm_generate = refusal_llm2
+    try:
+        class _ClsStore:
+            async def is_processed(self, fid, tid=None):
+                return False
+
+            async def mark_processed(self, fid, tid=None):
+                return True
+
+        class _ReplyApi:
+            uin = "10001"
+            qq_nickname = ""
+
+            def __init__(self):
+                self.replies = []
+
+            async def get_list(self, *a, **kw):
+                return [{"tid": "f1", "target_qq": "10001", "content": "我的说说",
+                         "images": [], "comments": [
+                             {"qq_account": "20001", "nickname": "友", "content": "好图",
+                              "comment_tid": 111, "created_time": ""}]}]
+
+            async def reply(self, *a, **kw):
+                self.replies.append(a)
+                return True
+
+        class _P:
+            class config:
+                class reply:
+                    scan_count = 5
+                    max_replies_per_run = 10
+                    reply_interval_sec = 0
+                    prompt = "你是{bot_name}。说说：{content}；评论者：{nickname}；评论：{comment_content}"
+
+        rapi = _ReplyApi()
+        rm = reply_manager.ReplyManager(_P(), _ClsStore())
+        await rm.reply_new_comments(rapi)
+        check("M07 回评路径也不发布拒答",
+              not rapi.replies, f"却回复了：{rapi.replies[:1]}" if rapi.replies else "已拦截")
+    finally:
+        reply_manager._llm_generate = orig2
+
+
 def test_manifest():
     section("F. Manifest")
     m = json.loads((Path(PLUGIN_DIR) / "_manifest.json").read_text(encoding="utf-8"))
@@ -1072,6 +1261,9 @@ async def _amain():
     await test_image_host_downgrade()
     await test_failure_markers_excluded()
     await test_image_failure_diagnostics()
+    await test_skip_download_when_vision_unavailable()
+    test_refusal_detection()
+    await test_refusal_not_published()
     test_manifest()
 
 

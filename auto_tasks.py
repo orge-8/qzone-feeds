@@ -9,7 +9,7 @@ import asyncio
 import datetime
 import random
 
-from .reply_manager import _llm_generate, sanitize_llm_output
+from .reply_manager import _llm_generate, looks_like_refusal, sanitize_llm_output
 
 
 class NoLogger:
@@ -150,6 +150,10 @@ async def process_feeds(
             if has_material and random.random() <= comment_probability:
                 prompt = comment_prompt_tpl.format(target_name=target_qq, content=content)
                 comment_text = sanitize_llm_output(await _llm_generate(plugin, prompt))
+                if comment_text and looks_like_refusal(comment_text):
+                    # 拒答文本绝不能发布——会变成 bot 在好友空间里公开"教训"对方
+                    logger.warning(f"LLM 返回拒答内容，跳过评论 {fid}: {comment_text[:50]}")
+                    comment_text = ""
                 if comment_text:
                     ok = await api.comment(fid, target_qq, comment_text)
                     if ok:

@@ -109,6 +109,14 @@ class VisionManager:
             return False
         return url in self._desc_cache
 
+    def is_available(self) -> bool:
+        """视觉链路是否真正可用（开关开启 且 任务名/模型名已配置）。
+
+        供调用方在下载图片**之前**短路：不可用时不必下载与压缩
+        （真机实测过 6 张图白下载白压缩，最后只拿到占位符）。
+        """
+        return self._get_enabled() and bool(self._get_vision_params())
+
     def _cache_get(self, url: str) -> str | None:
         if not self._get_cache_enabled():
             return None
