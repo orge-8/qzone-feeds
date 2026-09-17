@@ -118,6 +118,14 @@ processed_store.py   已处理记录（LRU 200 feeds / 100 comments，防抖批�
   与图片限额（`max_images_per_feed` / `image_concurrency` / 压缩参数）——旧版写死
   `describe_images=False`，自动评论完全"看不到"配图，只能凭正文发挥。担心耗时可用
   `max_images_per_feed` 调低单条识别张数；配置不可读时保守降级为不识别（等价旧行为）。
+- **评论注入人物画像**（v1.2.6）：评论好友动态前经 `ctx.person` 查询 MaiBot 自带人物库
+  （只读，不写入），昵称（`person_name` 属性）替换 prompt 里的裸 QQ 号、印象
+  （`memory_points` 列表，自动提取内容段、去权重噪声、截断至 5 条）以
+  「你对TA的了解：…」追加进 prompt。**全链路防御式降级**：人物库查不到 / 能力不存在 /
+  RPC 超时（5s）/ Host 失败 dict 一律静默回退——昵称退 QQ 号、画像消失不留痕，
+  未认识用户的「未知用户XXXX」占位名也拒绝采用，绝不阻塞评论主流程。
+  属性名可配（`person_name_field` / `person_state_field`），总开关 `enable_person_context`。
+  画像内容由 MaiBot 主框架在日常聊天中自动积累，本插件不产生写入。
 - **适配 MaiBot 1.2.5 的任务名/模型名拆分**（v1.2.1）：1.2.5 起 `llm.generate` 的 `model`
   参数按**具体模型名**解释，任务名拆到新参数 `task_name`（SDK 2.8.1 默认 `utils`）。
   本插件新增 `text_task` / `text_model_name` 与 `vision_task` / `vision_model_name` 字段；

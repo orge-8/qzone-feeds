@@ -6,3 +6,6 @@ tests/__pycache__/
 
 # 运行时数据目录（cookies/processed_list 由插件写入 ctx.paths.data_dir）
 data/
+
+# 本地 Python 虚拟环境
+.venv/

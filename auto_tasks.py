@@ -9,6 +9,7 @@ import asyncio
 import datetime
 import random
 
+from .person_context import fetch_person_context
 from .reply_manager import _llm_generate, looks_like_refusal, sanitize_llm_output
 
 
@@ -84,6 +85,19 @@ _DEFAULT_COMMENT_PROMPT = (
     "请以 bot 身份写一条自然的评论，口语化、不超过40字、只输出评论内容。"
 )
 
+# 画像注入说明（{target_profile} 非空时插入，空时整个提示消失）
+_PROFILE_HINT = ("你对TA的了解：{target_profile}。评论要符合你对TA的了解，"
+                 "但不要复述画像内容。")
+
+
+def _build_comment_prompt(tpl: str, target_name: str, content: str,
+                          profile: str = "") -> str:
+    """组装评论 prompt：画像非空时附加画像提示，空时不留痕迹。"""
+    prompt = tpl.format(target_name=target_name, content=content)
+    if profile:
+        prompt += _PROFILE_HINT.format(target_profile=profile)
+    return prompt
+
 
 async def process_feeds(
     plugin,
@@ -95,6 +109,9 @@ async def process_feeds(
     blacklist: set | None = None,
     action_interval: float = 3.0,
     comment_prompt_tpl: str | None = None,
+    person_context_enabled: bool = True,
+    person_name_field: str = "person_name",
+    person_state_field: str = "memory_points",
 ) -> dict:
     """一批说说的点赞+评论核心流程。
 
@@ -148,7 +165,17 @@ async def process_feeds(
             logger.info(f"说说 {fid} 有 {dropped} 张图未获得有效描述，已从评论素材中剔除")
         try:
             if has_material and random.random() <= comment_probability:
-                prompt = comment_prompt_tpl.format(target_name=target_qq, content=content)
+                # 人物上下文（昵称+画像）：失败/关闭时静默降级为 QQ 号 / 空画像
+                if person_context_enabled:
+                    person_ctx = await fetch_person_context(
+                        plugin, target_qq,
+                        name_field=person_name_field,
+                        state_field=person_state_field)
+                else:
+                    person_ctx = {"name": target_qq, "state": ""}
+                prompt = _build_comment_prompt(
+                    comment_prompt_tpl, person_ctx["name"], content,
+                    profile=person_ctx["state"])
                 comment_text = sanitize_llm_output(await _llm_generate(plugin, prompt))
                 if comment_text and looks_like_refusal(comment_text):
                     # 拒答文本绝不能发布——会变成 bot 在好友空间里公开"教训"对方
@@ -234,6 +261,9 @@ async def run_auto_job(plugin, api, store, reply_manager) -> dict:
                     blacklist=blacklist,
                     action_interval=float(getattr(cfg, "action_interval_sec", 3)),
                     comment_prompt_tpl=str(getattr(cfg, "comment_prompt", "") or _DEFAULT_COMMENT_PROMPT),
+                    person_context_enabled=bool(getattr(cfg, "enable_person_context", True)),
+                    person_name_field=str(getattr(cfg, "person_name_field", "person_name") or "person_name"),
+                    person_state_field=str(getattr(cfg, "person_state_field", "memory_points") or "memory_points"),
                 )
                 summary_parts.append(
                     f"处理{stats['handled']}条好友动态（拉取{len(feeds_list)}，赞{stats['liked']}/评{stats['commented']}）")
