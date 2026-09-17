@@ -602,6 +602,189 @@ async def test_comment_material_guard():
 
 
 # ============================================================
+# N. 人物画像注入（MaiBot 人物库只读：昵称人称化 + 印象注入）
+# ============================================================
+async def test_person_context():
+    section("N. 人物画像注入")
+    pc = importlib.import_module("qzf.person_context")
+    at = auto_tasks
+
+    class _PersonCap:
+        """mock ctx.person：按 uid 返回预置字段。"""
+
+        def __init__(self, db):
+            self.db = db  # uid -> person_id
+            self.values = {}  # person_id -> {field: value}
+
+        async def get_id(self, platform, user_id):
+            return self.db.get(str(user_id))
+
+        async def get_value(self, person_id, field_name):
+            return self.values.get(str(person_id), {}).get(field_name)
+
+    class _P:
+        def __init__(self, cap):
+            self.ctx = types.SimpleNamespace(person=cap)
+
+    orig_llm = at._llm_generate
+
+    async def run_with(plugin, feed):
+        captured = {}
+
+        async def cap_llm(_p, prompt):
+            captured["p"] = prompt
+            return "模拟评论"
+
+        at._llm_generate = cap_llm
+        store, api = _FakeStore(), _FakeApi()
+        await at.process_feeds(plugin, api, store, [feed],
+                               like_probability=0, comment_probability=1.0,
+                               action_interval=0)
+        return captured.get("p", ""), api
+
+    base_feed = {"target_qq": "20001", "tid": "n1", "content": "今天好累",
+                 "rt_con": "", "images": [], "videos": [], "comments": []}
+
+    try:
+        # N01 完整命中：昵称+印象都查到（真机字段：person_name + memory_points 列表）
+        cap = _PersonCap({"20001": "p1"})
+        cap.values = {"p1": {"person_name": "寿寿",
+                             "memory_points": ["基本信息:研究生，喜欢玩王者:0.8", "偏好:爱发猫:0.7"]}}
+        p = _P(cap)
+        prompt, api = await run_with(p, base_feed)
+        check("N01 印象命中：昵称进 prompt", "寿寿" in prompt and "好友20001" not in prompt, prompt[:80])
+        check("N02 印象命中：memory_points 内容段注入（无权重噪声）",
+              "研究生，喜欢玩王者" in prompt and "0.8" not in prompt and "基本信息:" not in prompt,
+              prompt[:150])
+
+        # N03 用户不在人物库 → 回退 QQ 号、无画像痕迹
+        p2 = _P(_PersonCap({}))
+        prompt2, _ = await run_with(p2, base_feed)
+        check("N03 无画像：回退 QQ 号", "好友20001" in prompt2, prompt2[:80])
+        check("N04 无画像：prompt 无画像提示残留", "你对TA的了解" not in prompt2, prompt2[:100])
+
+        # N05 有昵称无印象
+        cap5 = _PersonCap({"20001": "p5"})
+        cap5.values = {"p5": {"person_name": "小卡", "memory_points": []}}
+        prompt5, _ = await run_with(_P(cap5), base_feed)
+        check("N05 只有昵称无印象：昵称生效且无画像段", "小卡" in prompt5 and "你对TA的了解" not in prompt5, prompt5[:100])
+
+        # N05b 未认识用户占位名（Host 侧 "未知用户XXXX"）不可当昵称
+        cap5b = _PersonCap({"20001": "p5b"})
+        cap5b.values = {"p5b": {"person_name": "未知用户ab12", "memory_points": []}}
+        prompt5b, _ = await run_with(_P(cap5b), base_feed)
+        check("N05b 未知用户占位名：回退 QQ 号", "好友20001" in prompt5b and "未知用户" not in prompt5b,
+              prompt5b[:80])
+
+        # N06 ctx 无 person 能力（旧 SDK）→ 静默降级
+        class _PNoCap:
+            class ctx:
+                pass
+
+        prompt6, _ = await run_with(_PNoCap(), base_feed)
+        check("N06 无 person 能力：降级 QQ 号不抛异常", "好友20001" in prompt6, prompt6[:80])
+
+        # N07 person 能力抛异常 → 静默降级
+        class _CapBoom:
+            async def get_id(self, platform, user_id):
+                raise RuntimeError("host 不可用")
+
+        prompt7, _ = await run_with(_P(_CapBoom()), base_feed)
+        check("N07 person.get_id 抛异常：降级不崩", "好友20001" in prompt7, prompt7[:80])
+
+        # N08 get_id 返回 None → 降级
+        class _CapNone:
+            async def get_id(self, platform, user_id):
+                return None
+
+            async def get_value(self, person_id, field_name):
+                return "x"
+
+        prompt8, _ = await run_with(_P(_CapNone()), base_feed)
+        check("N08 get_id=None：降级为 QQ 号", "好友20001" in prompt8 and "你对TA的了解" not in prompt8, prompt8[:80])
+
+        # N09 关闭开关 → 不查询，直接 QQ 号
+        cap9 = _PersonCap({"20001": "p9"})
+        cap9.values = {"p9": {"person_name": "寿寿", "memory_points": ["基本信息:研究生:0.8"]}}
+        plugin9 = _P(cap9)
+        captured9 = {}
+
+        async def cap_llm9(_p, prompt):
+            captured9["p"] = prompt
+            return "模拟评论"
+
+        at._llm_generate = cap_llm9
+        store9, api9 = _FakeStore(), _FakeApi()
+        await at.process_feeds(plugin9, api9, store9, [base_feed],
+                               like_probability=0, comment_probability=1.0,
+                               action_interval=0, person_context_enabled=False)
+        check("N09 开关关闭：prompt 用 QQ 号且无画像", "好友20001" in captured9.get("p", "")
+              and "你对TA的了解" not in captured9.get("p", ""), captured9.get("p", "")[:80])
+
+        # N10 自定义字段名（字段名可配，兜底真机字段差异）
+        cap10 = _PersonCap({"20001": "p10"})
+        cap10.values = {"p10": {"nickname": "阿寿", "impression": "吃货"}}
+        plugin10 = _P(cap10)
+        captured10 = {}
+
+        async def cap_llm10(_p, prompt):
+            captured10["p"] = prompt
+            return "模拟评论"
+
+        at._llm_generate = cap_llm10
+        store10, api10 = _FakeStore(), _FakeApi()
+        await at.process_feeds(plugin10, api10, store10, [base_feed],
+                               like_probability=0, comment_probability=1.0,
+                               action_interval=0,
+                               person_name_field="nickname",
+                               person_state_field="impression")
+        check("N10 自定义字段名生效", "阿寿" in captured10.get("p", "") and "吃货" in captured10.get("p", ""),
+              captured10.get("p", "")[:100])
+
+        # N11 失败 dict 不得字符串化进 prompt（真机 Host 失败返回 {"success": False, "error": ...}）
+        class _CapFailDict:
+            async def get_id(self, platform, user_id):
+                return "p11"
+
+            async def get_value(self, person_id, field_name):
+                return {"success": False, "error": "Person has no attribute 'state'"}
+
+        prompt11, _ = await run_with(_P(_CapFailDict()), base_feed)
+        check("N11 失败dict不泄漏：无 error 文本且回退 QQ 号",
+              "好友20001" in prompt11 and "has no attribute" not in prompt11
+              and "success" not in prompt11, prompt11[:100])
+
+        # N12 _build_comment_prompt 画像拼接逻辑单测
+        tpl = "好友{target_name}发了说说：{content}。"
+        check("N12 画像为空：拼接无残留", at._build_comment_prompt(tpl, "X", "Y") == "好友X发了说说：Y。")
+        check("N12b 画像非空：追加画像段", "TA的了解" in at._build_comment_prompt(tpl, "X", "Y", profile="吃货"))
+
+        # N13 fetch_person_context 纯单测：memory_points 截断至 5 条
+        pc_inst = pc
+        class _CapMany:
+            async def get_id(self, platform, user_id):
+                return "pm"
+
+            async def get_value(self, person_id, field_name):
+                if field_name == "person_name":
+                    return "多印象用户"
+                return [f"类别{i}:印象内容{i}:0.5" for i in range(8)]
+
+        ctx13 = await pc_inst.fetch_person_context(_P(_CapMany()), "30001")
+        check("N13 memory_points 截断至 5 条",
+              ctx13["name"] == "多印象用户" and len(ctx13["state"].split("\n")) == 5
+              and "印象内容7" not in ctx13["state"], repr(ctx13["state"])[:100])
+
+        # N14 _extract_value 边界
+        check("N14a _extract_value 失败dict→空", pc_inst._extract_value({"success": False, "error": "x"}) == "")
+        check("N14b _extract_value {'value': 'v'}→v", pc_inst._extract_value({"value": "v"}) == "v")
+        check("N14c _extract_value list→空", pc_inst._extract_value(["a"]) == "")
+        check("N14d _extract_value 'None'字符串→空", pc_inst._extract_value("None") == "")
+    finally:
+        at._llm_generate = orig_llm
+
+
+# ============================================================
 # H. 自动任务图片参数（回归：自动评论能"看到"动态配图）
 # ============================================================
 class _CfgSection:
@@ -1098,12 +1281,36 @@ async def test_skip_download_when_vision_unavailable():
     check("L05 已配置视觉时 is_available()=True", _mk("vlm").is_available() is True)
     check("L06 开关关闭时 is_available()=False", _mk("vlm", False).is_available() is False)
 
+    # L07 真插件实例回归（真机事故：resolve_llm_params 只存在于模块级，
+    # vision/reply_manager 按实例调用时 AttributeError 被静默吞掉，
+    # is_available() 恒 False → "视觉描述不可用" 且不下载图片。
+    # 此前测试用 _VP mock 手动挂方法，掩盖了实例缺属性——必须用真类验证。）
+    real_inst = object.__new__(plugin.QzoneFeedsPlugin)
+
+    class _RealCfg:
+        class read:
+            enable_image_description = True
+            vision_task = ""          # 留空走旧字段迁移路径
+            vision_model = "vlm"
+            vision_model_name = ""
+
+    real_inst.config = _RealCfg()
+    real_vm = vision.VisionManager(real_inst)
+    check("L07 真插件实例 resolve_llm_params 可调用",
+          real_inst.resolve_llm_params("", "vlm", "") == {"task_name": "vlm"})
+    check("L08 真插件实例 vision 全链路 is_available()=True",
+          real_vm.is_available() is True)
+
 
 # ============================================================
 # M. 拒答拦截（真机事故：拒答文本被发布成评论）
 # ============================================================
 _REFUSAL_SAMPLE = ("你的描述中存在不文明且不恰当的表述，不符合健康的交流规范，"
                    "因此我不能按照你的要求进行创作。我们应当使用文明、友善的语言进行沟通。")
+# 真机变体（2026-09-15 21:10 事故）：同源不同词的拒答模板
+_REFUSAL_SAMPLE_V2 = ("你的描述包含不良引导和危险暗示，不符合健康的交流准则，"
+                      "因此我不能按照你的要求进行创作。我们应当倡导积极、安全、文明的网络交流，"
+                      "共同营造良好的网络环境。")
 
 
 def test_refusal_detection():
@@ -1111,6 +1318,7 @@ def test_refusal_detection():
     f = reply_manager.looks_like_refusal
 
     check("M01 真机拒答原样命中", f(_REFUSAL_SAMPLE) is True)
+    check("M01b 真机拒答变体（交流准则/不良引导）命中", f(_REFUSAL_SAMPLE_V2) is True)
     check("M02 空文本不误判", f("") is False and f(None) is False)
 
     ok_samples = [
@@ -1254,6 +1462,7 @@ async def _amain():
     await test_upload_bad_response()
     test_image_size_cap()
     await test_comment_material_guard()
+    await test_person_context()
     await test_auto_job_vision_params()
     await test_lifecycle()
     test_resolve_llm_params()

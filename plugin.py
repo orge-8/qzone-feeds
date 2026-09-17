@@ -18,6 +18,7 @@ from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
 
 from .auto_tasks import AutoTaskLoop, _is_in_silent_period, process_feeds, run_auto_job
 from .cookie_manager import CookieManager
+from .person_context import set_person_context_logger
 from .processed_store import ProcessedStore
 from .qzone_api import (
     CookieExpiredError,
@@ -152,8 +153,12 @@ class AutoConfig(PluginConfigBase):
     comment_prompt: str = Field(
         default=("好友{target_name}发了说说：{content}。"
                  "请以 bot 身份写一条自然的评论，口语化、不超过40字、只输出评论内容。"),
-        description="自动评论好友动态的LLM提示词模板",
+        description="自动评论好友动态的LLM提示词模板（可用 {target_name} {content}；"
+                    "画像非空时自动附加你对TA的了解）",
     )
+    enable_person_context: bool = Field(default=True, description="评论时注入 MaiBot 人物画像（昵称+印象，只读）")
+    person_name_field: str = Field(default="person_name", description="人物昵称属性名（Host Person 对象属性）")
+    person_state_field: str = Field(default="memory_points", description="人物印象属性名（memory_points 列表自动提取内容段）")
 
 
 class QueueConfig(PluginConfigBase):
@@ -288,6 +293,16 @@ def format_feed(feed: dict, index: int | None = None) -> str:
 class QzoneFeedsPlugin(MaiBotPlugin):
     config_model = QzoneFeedsConfig
 
+    def resolve_llm_params(self, task: str, model: str, model_name: str) -> dict:
+        """实例方法委托到模块级同名函数。
+
+        vision.py / reply_manager.py 均按 `plugin.resolve_llm_params(...)` 实例调用；
+        此前只有模块级函数，实例上不存在该属性 → AttributeError 被调用方
+        `except (AttributeError, ...)` 静默吞掉 → kwargs 恒为 {} →
+        vision 判定"未配置"直接短路（真机日志：视觉描述不可用）。
+        """
+        return resolve_llm_params(task, model, model_name)
+
     def __init__(self):
         super().__init__()
         self._cookie_mgr: CookieManager | None = None
@@ -316,6 +331,7 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         _cm.set_cookie_manager_logger(logger)
         _ps.set_processed_store_logger(logger)
         _rm.set_reply_manager_logger(logger)
+        set_person_context_logger(logger)
 
         data_dir = self._resolve_data_dir()
         self._cookie_mgr = CookieManager(self, data_dir)
@@ -679,11 +695,15 @@ class QzoneFeedsPlugin(MaiBotPlugin):
                 return {"ok": False, "msg": str(feeds[0]["error"])}
             blocks = [format_feed(f, i + 1) for i, f in enumerate(feeds)]
             # 点赞+评论（未处理过的条目逐条处理，去重走 processed_list）
+            auto_cfg = self.config.auto
             stats = await process_feeds(
                 self, api, self._store, feeds,
                 like_probability=1.0, comment_probability=1.0,
-                action_interval=float(self.config.auto.action_interval_sec or 3),
-                comment_prompt_tpl=str(self.config.auto.comment_prompt or ""),
+                action_interval=float(auto_cfg.action_interval_sec or 3),
+                comment_prompt_tpl=str(auto_cfg.comment_prompt or ""),
+                person_context_enabled=bool(getattr(auto_cfg, "enable_person_context", True)),
+                person_name_field=str(getattr(auto_cfg, "person_name_field", "person_name") or "person_name"),
+                person_state_field=str(getattr(auto_cfg, "person_state_field", "memory_points") or "memory_points"),
             )
             blocks.append(
                 f"已点赞 {stats['liked']} 条 / 评论 {stats['commented']} 条"
