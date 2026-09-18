@@ -969,7 +969,8 @@ async def test_resolve_llm_callers():
     p = _P()
     out = await reply_manager._llm_generate(p, "hi")
     check("I08 reply_manager 旧配置迁移后走 task_name=replyer",
-          p.ctx.llm.kwargs == {"task_name": "replyer"} and out == "ok",
+          # timeout_ms 为 RPC 传输层超时（v1.2.7 抬升 replyer RPC 上限），业务 kwargs 不含它
+          p.ctx.llm.kwargs == {"timeout_ms": 120_000, "task_name": "replyer"} and out == "ok",
           f"kwargs={p.ctx.llm.kwargs}")
 
     # vision 调用侧
@@ -990,7 +991,9 @@ async def test_resolve_llm_callers():
     vm = vision.VisionManager(vp)
     desc = await vm.get_image_description("https://a/1.png", "iVBORw0KGgo=")
     check("I09 vision 旧配置迁移后走 task_name=vlm",
-          vp.ctx.llm.kwargs == {"task_name": "vlm"} and desc != vision.PLACEHOLDER_FAILED,
+          # timeout_ms 为 RPC 传输层超时（v1.2.7 抬升 VLM RPC 上限），业务 kwargs 不含它
+          vp.ctx.llm.kwargs == {"timeout_ms": vision.DESC_RPC_TIMEOUT_MS, "task_name": "vlm"}
+          and desc != vision.PLACEHOLDER_FAILED,
           f"kwargs={vp.ctx.llm.kwargs} desc={desc[:20]!r}")
 
     # vision 双空 → 占位符（不调 LLM）
@@ -1439,6 +1442,124 @@ def test_manifest():
 
 
 # ============================================================
+# G2. singleflight：同一 URL 并发调用只跑一次 VLM（v1.2.8 重复描述修复）
+# ============================================================
+async def test_singleflight_dedup():
+    section("G2. singleflight 并发去重（同 URL 只识别一次）")
+
+    real_calls = {"n": 0}
+
+    class _VP:
+        resolve_llm_params = staticmethod(plugin.resolve_llm_params)
+
+        class config:
+            class read:
+                vision_task = "vlm"
+                vision_model = ""
+                vision_model_name = ""
+                enable_image_description = True
+                enable_desc_cache = True
+                desc_cache_size = 200
+
+        class ctx:
+            class llm:
+                @staticmethod
+                async def generate(prompt, **kw):
+                    real_calls["n"] += 1
+                    await asyncio.sleep(0.05)  # 模拟 VLM 耗时，放大竞态窗口
+                    return {"response": f"desc-{real_calls['n']}"}
+
+    vp = _VP()
+    vm = vision.VisionManager(vp)
+    url = "https://m.qpic.cn/dup.jpg"
+    b64 = "iVBORw0KGgo="
+
+    # 5 个协程同时请求同一 URL（缓存均未命中）→ 应只触发 1 次 VLM
+    results = await asyncio.gather(*[vm.get_image_description(url, b64) for _ in range(5)])
+    check("G2.1 同 URL 5 并发只调 1 次 VLM",
+          real_calls["n"] == 1, f"实际 VLM 调用数={real_calls['n']}")
+    check("G2.2 全部协程拿到同一描述",
+          len(set(results)) == 1 and results[0] == "desc-1", f"results={results}")
+
+    # 串行第二次调用 → 走缓存，不再调 VLM
+    again = await vm.get_image_description(url, b64)
+    check("G2.3 串行复调走缓存", again == "desc-1" and real_calls["n"] == 1,
+          f"desc={again!r} 调用数={real_calls['n']}")
+
+    # 无 URL（base64 直传路径）：内容相同 → 哈希命中，同样不重复 VLM
+    r2 = await vm.get_image_description("", b64)
+    check("G2.4 空 URL 同内容走哈希缓存", r2 == "desc-1" and real_calls["n"] == 1,
+          f"desc={r2!r} 调用数={real_calls['n']}")
+
+    # 空 URL + 不同内容 → 正常识别
+    r3 = await vm.get_image_description("", "aGVsbG8=")
+    check("G2.5 空 URL 不同内容正常识别", r3 == "desc-2" and real_calls["n"] == 2,
+          f"desc={r3!r} 调用数={real_calls['n']}")
+
+
+# ============================================================
+# G3. 内容哈希二级缓存：URL 轮换（同图不同 URL）不再重复 VLM（v1.2.8）
+# ============================================================
+async def test_hash_cache_url_rotation():
+    section("G3. 内容哈希缓存（Qzone URL 轮换场景）")
+
+    real_calls = {"n": 0}
+
+    class _VP:
+        resolve_llm_params = staticmethod(plugin.resolve_llm_params)
+
+        class config:
+            class read:
+                vision_task = "vlm"
+                vision_model = ""
+                vision_model_name = ""
+                enable_image_description = True
+                enable_desc_cache = True
+                desc_cache_size = 200
+
+        class ctx:
+            class llm:
+                @staticmethod
+                async def generate(prompt, **kw):
+                    real_calls["n"] += 1
+                    return {"response": f"hdesc-{real_calls['n']}"}
+
+    vp = _VP()
+    vm = vision.VisionManager(vp)
+    b64 = "iVBORw0KGgo="  # 固定内容（同一张图）
+    url_round1 = "https://m.qpic.cn/psc?/TOKEN-A/img.jpg"
+    url_round2 = "https://m.qpic.cn/psc?/TOKEN-B/img.jpg"  # 同图，URL 签名已轮换
+
+    d1 = await vm.get_image_description(url_round1, b64)
+    check("G3.1 首轮正常识别", d1 == "hdesc-1" and real_calls["n"] == 1,
+          f"desc={d1!r} 调用数={real_calls['n']}")
+
+    # 第二轮：URL 不同 → URL 缓存未命中；但内容哈希相同 → 应跳过 VLM
+    d2 = await vm.get_image_description(url_round2, b64)
+    check("G3.2 URL 轮换后哈希命中不重复 VLM",
+          d2 == "hdesc-1" and real_calls["n"] == 1,
+          f"desc={d2!r} 调用数={real_calls['n']}")
+
+    # 识别失败的描述不得进入哈希缓存（避免坏结果固化）
+    real_calls["n"] = 0
+
+    class _FailVP(_VP):
+        class ctx:
+            class llm:
+                @staticmethod
+                async def generate(prompt, **kw):
+                    real_calls["n"] += 1
+                    return {"response": ""}
+
+    vf = vision.VisionManager(_FailVP())
+    f1 = await vf.get_image_description("https://x/1.jpg", b64)
+    f2 = await vf.get_image_description("https://x/2.jpg", b64)  # URL 不同、内容相同
+    check("G3.3 失败占位符不入哈希缓存",
+          real_calls["n"] == 2 and f1 == f2 == vision.PLACEHOLDER_FAILED,
+          f"调用数={real_calls['n']} descs={f1!r},{f2!r}")
+
+
+# ============================================================
 # main
 # ============================================================
 async def _amain():
@@ -1473,6 +1594,8 @@ async def _amain():
     await test_skip_download_when_vision_unavailable()
     test_refusal_detection()
     await test_refusal_not_published()
+    await test_singleflight_dedup()
+    await test_hash_cache_url_rotation()
     test_manifest()
 
 

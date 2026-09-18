@@ -118,6 +118,21 @@ processed_store.py   已处理记录（LRU 200 feeds / 100 comments，防抖批�
   与图片限额（`max_images_per_feed` / `image_concurrency` / 压缩参数）——旧版写死
   `describe_images=False`，自动评论完全"看不到"配图，只能凭正文发挥。担心耗时可用
   `max_images_per_feed` 调低单条识别张数；配置不可读时保守降级为不识别（等价旧行为）。
+- **图片重复描述修复**（v1.2.8）：真机 09-18 日志显示同批图（压缩指纹完全一致）
+  31 分钟内被 VLM 描述两遍——根因是 Qzone 图床 URL 每轮拉取动态都轮换签名 token，
+  以 URL 为键的 LRU 缓存必然失效。两层修复：
+  ① **内容哈希二级缓存**——图片 base64 的 sha256 作键，URL 轮换了也没关系，
+  下载（KB 级，便宜）后哈希命中即跳过 VLM（20s+，贵的部分）；失败占位符不入缓存。
+  ② **singleflight 并发去重**——同一 URL 被多个协程同时调用（缓存均未命中）时
+  只跑一次真实识别，其余协程共享结果。另修 `get_list` 的 pic/video URL 未去重
+  （`get_qzone_list` 已有）。
+- **LLM RPC 超时抬升，修复 replyer 30s 误杀**（v1.2.7）：SDK `call_capability` 默认 RPC
+  传输超时 30s，低于 replyer 任务思考模型（`deepseek-v4-pro-think`，Host
+  `slow_threshold=120s`）的正常耗时下限——思考稍久就被 RPC 层以 `E_TIMEOUT` 误杀，
+  该条动态只点赞不评论。现经 SDK `call_capability` 的 `timeout_ms` **具名参数**
+  （SDK 自行消费、不混入业务 args，已在 maibot_sdk 源码验证转发链路）抬升：
+  reply_manager 120s（对齐 Host slow_threshold）、vision 55s（VLM 非思考模型）；
+  插件总闸 wait_for 相应抬至 130s / 60s 保持兜底。降级路径不变：超时→空串→跳过评论。
 - **评论注入人物画像**（v1.2.6）：评论好友动态前经 `ctx.person` 查询 MaiBot 自带人物库
   （只读，不写入），昵称（`person_name` 属性）替换 prompt 里的裸 QQ 号、印象
   （`memory_points` 列表，自动提取内容段、去权重噪声、截断至 5 条）以

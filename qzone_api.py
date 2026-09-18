@@ -755,6 +755,8 @@ class QzoneAPI:
                     urls.append(pic.get("smallurl") or pic.get("url1") or pic.get("pic_id"))
                 for video in (msg.get("video") or []):
                     urls.append(video.get("url1") or video.get("pic_url"))
+                # 去重（v1.2.8）：同一条说说内重复 URL 会导致同一张图重复下载+重复 VLM
+                urls = list(dict.fromkeys(u for u in urls if u))
                 images = await self._describe_images(urls, max_images, image_concurrency,
                                                      compress=compress, max_edge=max_edge, quality=quality)
 

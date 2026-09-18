@@ -116,6 +116,13 @@ async def _llm_generate(plugin, prompt: str) -> str:
 
     任务名/模型名经 plugin.resolve_llm_params 解析（兼容 MaiBot 1.2.5 的语义拆分），
     失败日志同时打出 kwargs——只有 Host 错误文本时分不清名字是配置填的还是 SDK 默认值。
+
+    超时分层（2026-09-19 修复 replyer E_TIMEOUT）：
+    - RPC 传输层：SDK call_capability 的 timeout_ms 具名参数（SDK 自行消费，
+      不会混入业务 args），默认 30s——低于 thinking 模型（replyer 任务
+      deepseek-v4-pro-think，Host slow_threshold=120s）的正常耗时下限，
+      导致思考稍久就被 RPC 层误杀。这里抬到 120s 对齐 Host slow_threshold。
+    - 插件总闸：wait_for 130s > RPC 120s，保持总闸兜底略高于传输层的防御性设计。
     """
     kwargs: dict = {}
     try:
@@ -129,12 +136,12 @@ async def _llm_generate(plugin, prompt: str) -> str:
         except (AttributeError, RuntimeError):
             kwargs = {}
         result = await asyncio.wait_for(
-            plugin.ctx.llm.generate(prompt, **kwargs),
-            timeout=60,
+            plugin.ctx.llm.generate(prompt, timeout_ms=120_000, **kwargs),
+            timeout=130,
         )
         return str(result.get("response") or "").strip()
     except asyncio.TimeoutError:
-        logger.error("LLM 生成超时（>60s）")
+        logger.error("LLM 生成超时（>130s）")
         return ""
     except Exception as e:
         logger.error(f"LLM 生成失败: {e}（kwargs={kwargs!r}）")
