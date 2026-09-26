@@ -235,8 +235,8 @@ def _auto_vision_params(plugin) -> tuple[bool, int, int, bool, int, int]:
         return False, 9, 3, True, 1024, 80
 
 
-async def run_auto_job(plugin, api, store, reply_manager) -> dict:
-    """自动任务主体（在队列 worker 中执行）：读好友动态+点赞/评论 + 回复新评论。
+async def run_auto_job(plugin, api, store, reply_manager, atme_manager=None) -> dict:
+    """自动任务主体（在队列 worker 中执行）：读好友动态+点赞/评论 + 回复新评论 + 回复被@。
 
     Returns:
         {"ok": bool, "summary": str}
@@ -287,6 +287,15 @@ async def run_auto_job(plugin, api, store, reply_manager) -> dict:
         except Exception as e:
             logger.error(f"自动回评异常: {e}")
             summary_parts.append(f"自动回评异常: {e}")
+
+    # ===== 3. 被@检测与回复（「与我相关」接口）=====
+    if atme_manager is not None and bool(getattr(cfg, "enable_atme_reply", False)):
+        try:
+            ok, msg = await atme_manager.reply_atme_mentions(api)
+            summary_parts.append(("被@: " if ok else "被@检测失败: ") + msg)
+        except Exception as e:
+            logger.error(f"被@回复异常: {e}")
+            summary_parts.append(f"被@回复异常: {e}")
 
     return {"ok": True, "summary": "；".join(summary_parts) if summary_parts else "无启用的自动任务"}
 
@@ -340,7 +349,9 @@ class AutoTaskLoop:
     def _should_run(self) -> bool:
         try:
             cfg = self._plugin.config.auto
-            return bool(getattr(cfg, "enable_auto_read", False) or getattr(cfg, "enable_auto_reply", False))
+            return bool(getattr(cfg, "enable_auto_read", False)
+                        or getattr(cfg, "enable_auto_reply", False)
+                        or getattr(cfg, "enable_atme_reply", False))
         except AttributeError:
             return False
 

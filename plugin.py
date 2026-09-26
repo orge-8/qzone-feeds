@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
 
 from .auto_tasks import AutoTaskLoop, _is_in_silent_period, process_feeds, run_auto_job
+from .atme_manager import AtmeManager, set_atme_manager_logger
 from .cookie_manager import CookieManager
 from .person_context import set_person_context_logger
 from .processed_store import ProcessedStore
@@ -159,6 +160,16 @@ class AutoConfig(PluginConfigBase):
     enable_person_context: bool = Field(default=True, description="评论时注入 MaiBot 人物画像（昵称+印象，只读）")
     person_name_field: str = Field(default="person_name", description="人物昵称属性名（Host Person 对象属性）")
     person_state_field: str = Field(default="memory_points", description="人物印象属性名（memory_points 列表自动提取内容段）")
+    enable_atme_reply: bool = Field(
+        default=False,
+        description="被@检测与回复（「与我相关」接口：正文@→评论说说，评论@→回评该评论）")
+    atme_poll_count: int = Field(default=10, description="每轮拉取「与我相关」条数（1~20）")
+    atme_max_replies_per_run: int = Field(default=5, description="单轮被@回复上限")
+    atme_prompt: str = Field(
+        default=("你是{bot_name}，你在QQ空间被好友@了。"
+                 "说说内容：{post}；互动者：{nickname}；相关内容：{mention_content}。"
+                 "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"),
+        description="被@回复的LLM提示词模板（可用 {bot_name} {post} {nickname} {mention_content}）")
 
 
 class QueueConfig(PluginConfigBase):
@@ -308,6 +319,7 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         self._cookie_mgr: CookieManager | None = None
         self._store: ProcessedStore | None = None
         self._reply_mgr: ReplyManager | None = None
+        self._atme_mgr: AtmeManager | None = None
         self._auto_loop: AutoTaskLoop | None = None
         self._queue: asyncio.Queue | None = None
         self._worker_task: asyncio.Task | None = None
@@ -324,10 +336,12 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         except ImportError:
             logger.warning("Pillow 未安装，VLM 图片压缩不可用（将回退原图，略费 token/耗时）")
         from . import auto_tasks as _auto
+        from . import atme_manager as _atme
         from . import cookie_manager as _cm
         from . import processed_store as _ps
         from . import reply_manager as _rm
         _auto.set_auto_tasks_logger(logger)
+        _atme.set_atme_manager_logger(logger)
         _cm.set_cookie_manager_logger(logger)
         _ps.set_processed_store_logger(logger)
         _rm.set_reply_manager_logger(logger)
@@ -338,6 +352,7 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         self._cookie_mgr.load_from_disk()
         self._store = ProcessedStore(data_dir)
         self._reply_mgr = ReplyManager(self, self._store)
+        self._atme_mgr = AtmeManager(self, self._store)
         # 注入真实 VisionManager（上游 NoImageManager 缺陷修正）
         set_image_manager(VisionManager(self))
 
@@ -530,7 +545,7 @@ class QzoneFeedsPlugin(MaiBotPlugin):
             api = QzoneAPI(cookies)
             try:
                 if job["name"] == "auto_job":
-                    return await job["run"](self, api, self._store, self._reply_mgr)
+                    return await job["run"](self, api, self._store, self._reply_mgr, self._atme_mgr)
                 return await job["run"](api)
             except CookieExpiredError as e:
                 last_err = e
@@ -745,6 +760,8 @@ class QzoneFeedsPlugin(MaiBotPlugin):
             auto_desc.append(f"自动读动态(每{auto_cfg.interval_min}分钟,静默{auto_cfg.silent_hours})")
         if auto_cfg.enable_auto_reply:
             auto_desc.append("自动回评")
+        if bool(getattr(auto_cfg, "enable_atme_reply", False)):
+            auto_desc.append("被@回复")
         queue_depth = self._queue.qsize() if self._queue is not None else -1
         msg = (
             f"队列深度: {queue_depth}\n"

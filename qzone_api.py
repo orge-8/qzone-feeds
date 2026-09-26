@@ -10,6 +10,7 @@
 
 import asyncio
 import base64
+import html as html_lib
 import json
 import re
 import time
@@ -200,6 +201,8 @@ class QzoneAPI:
     COMMENT_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
     LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
     ZONE_LIST_URL = "https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more"
+    ATME_URL = ("https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com"
+                "/cgi-bin/feeds/feeds2_html_pav_all")
 
     def __init__(self, cookies_dict: dict | None = None):
         self.cookies = cookies_dict or {}
@@ -985,3 +988,121 @@ class QzoneAPI:
         except Exception as e:
             logger.error(f"解析说说错误：{str(e)}")
             return []
+
+    async def get_atme_list(self, offset: int = 0, count: int = 10) -> list[dict[str, Any]]:
+        """拉取「与我相关」列表（feeds2_html_pav_all，剥壳 _Callback(...) + json5）。
+
+        真机探测（2026-09-26，HTTP 200 + code=0）：
+        - g_tk 必须**p_skey 版**（5381 算法，本类 __init__ 的 gtk2 即此版本）
+        - 响应为 JSONP + 非标准 JS 字面量（键名无引号/单引号/裸true/尾部undefined）
+        - 条目种类：appid=403 访问主页（无 mood 链接）、217 赞说说、311 评论/回复
+        - 归一化后每条：uin/nickname/appid/time/action/content/post_uin/post_tid
+        失败返回 [{"error": msg}]（与 get_list 约定一致）。
+        """
+        client = self._get_client()
+        res = await client.request(
+            method="GET",
+            url=self.ATME_URL,
+            timeout=10,
+            params={
+                "uin": self.uin,
+                "begin_time": 0,
+                "end_time": 0,
+                "getappnotification": 1,
+                "getnotifi": 1,
+                "has_get_key": 0,
+                "offset": offset,
+                "set": 0,
+                "count": count,
+                "useutf8": 1,
+                "outputhtmlfeed": 1,
+                "scope": 1,
+                "g_tk": self.gtk2,
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                "Referer": f"https://user.qzone.qq.com/{self.uin}",
+                "Origin": "https://user.qzone.qq.com",
+                "Host": "user.qzone.qq.com",
+                "Connection": "keep-alive",
+            },
+            cookies=self.cookies,
+        )
+        if res.status_code != 200:
+            logger.error(f"「与我相关」访问失败: {res.status_code}")
+            return [{"error": f"HTTP {res.status_code}"}]
+
+        data = res.text
+        if data.startswith("_Callback(") and data.endswith(");"):
+            data = data[len("_Callback("):-2]
+        # 只在 JSON 结构位替换 undefined（同 get_qzone_list，防正文英文单词被改写）
+        data = re.sub(r"(?<=[:,\[])\s*undefined(?=\s*[,\]}])", "null", data)
+        try:
+            data_dict = json5.loads(data)
+        except Exception as e:
+            logger.error(f"解析「与我相关」响应失败: {e}")
+            return [{"error": f"解析失败: {e}"}]
+        if not isinstance(data_dict, dict):
+            return [{"error": "响应不是 JSON 对象"}]
+
+        code = data_dict.get("code")
+        self._check_login_code(code)
+        if code != 0:
+            return [{"error": data_dict.get("message") or f"code={code}"}]
+        return parse_atme_items(data_dict)
+
+
+# ===== 「与我相关」条目归一化（纯函数，可测） =====
+# 动作分类靠官方渲染文案匹配（真机实测）：先匹配长词防「提到我」子串误判。
+_ATME_COMMENT_MENTION_WORDS = ("评论提到我", "回复提到我")
+_ATME_MENTION_WORD = "提到我"
+# 从渲染 HTML 的 mood 链接提取说说归属。实测被@条目 tid 以 "." 结尾
+# （如 .../mood/fde859...0100.）、点赞条目带评论锚点（...0300.1），
+# msgdetail/msglist 只认无后缀的基础 tid → 截去第一个 "." 起的锚点后缀。
+_ATME_MOOD_RE = re.compile(r"qq\.com/(\d+)/mood/([0-9a-zA-Z.]+)")
+
+
+def _classify_atme_action(plain: str) -> str:
+    """条目纯文本 → 动作分类：mention(正文@) / comment_mention(评论@) / other。"""
+    if any(w in plain for w in _ATME_COMMENT_MENTION_WORDS):
+        return "comment_mention"
+    if _ATME_MENTION_WORD in plain:
+        return "mention"
+    return "other"
+
+
+def parse_atme_items(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """「与我相关」响应 dict → 归一化条目列表（纯函数）。
+
+    归一化字段：uin/nickname(互动者)、content(条目纯文本预览)、time(abstime)、
+    appid、action(mention/comment_mention/other)、post_uin/post_tid(说说归属，
+    无 mood 链接的条目如"访问主页"为 None)。
+    """
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        inner = inner.get("data")
+    if not isinstance(inner, list):
+        return []
+
+    result: list[dict[str, Any]] = []
+    for it in inner:
+        if not isinstance(it, dict):
+            continue
+        html_content = str(it.get("html") or "")
+        # 渲染 HTML → 纯文本（去标签 + 实体还原 + 压空白）
+        plain = re.sub(r"<[^>]+>", " ", html_content)
+        plain = html_lib.unescape(plain)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        m = _ATME_MOOD_RE.search(html_content)
+        result.append({
+            "uin": str(it.get("uin") or ""),
+            "nickname": str(it.get("nickname") or ""),
+            "appid": str(it.get("appid") or ""),
+            "time": int(it.get("abstime") or 0),
+            "action": _classify_atme_action(plain),
+            "content": plain,
+            "post_uin": m.group(1) if m else None,
+            "post_tid": m.group(2).split(".", 1)[0] if m else None,
+        })
+    return result

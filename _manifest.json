@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "org.orge-8.qzone-feeds",
-  "version": "1.2.9",
+  "version": "1.3.0",
   "name": "QQ空间动态",
-  "description": "发QQ动态、读好友动态、VLM识别动态配图、回复自己动态下的评论、定时自动读好友动态并点赞评论（自动任务带静默时段与概率控制，评论时注入MaiBot人物画像）。所有命令需管理员鉴权，Cookie 通过 napcat-adapter 自动获取，全局限速串行队列防风控。",
+  "description": "发QQ动态、读好友动态、VLM识别动态配图、回复自己动态下的评论、定时自动读好友动态并点赞评论（自动任务带静默时段与概率控制，评论时注入MaiBot人物画像）、被@检测与回复（「与我相关」接口，正文@评论说说、评论@回评原评论）。所有命令需管理员鉴权，Cookie 通过 napcat-adapter 自动获取，全局限速串行队列防风控。",
   "author": {
     "name": "orge-8",
     "url": "https://github.com/orge-8"

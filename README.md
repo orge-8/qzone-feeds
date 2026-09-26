@@ -36,6 +36,8 @@ MaiBot 插件：发 QQ 动态、读好友动态、VLM 识别动态配图、回�
   转发卡片里的原说说内容没有对应选择器，因此转发动态会落入「无可评论素材」分支被跳过评论。
   待拿到真机转发动态的原始 HTML 后可补上选择器。
 - 转发语含中文冒号时，`txt-box` 的 `split("：", 1)` 会截断冒号前的部分。
+- **被@回复的盲区（v1.3.0）**：好友在**别人的说说**下回复 bot 的评论，动作文案是「回复」
+  而非「回复提到我」，会被归 other 忽略——不覆盖该场景，避免 bot 在第三方说说下自作主张接话。
 
 ## 配置
 
@@ -66,11 +68,28 @@ desc_cache_size = 200         # VLM描述缓存容量（LRU条数，重启清空
 [auto]
 enable_auto_read = false      # 定时自动读好友动态并点赞/评论
 enable_auto_reply = false     # 自动回复自己动态的新评论
+enable_atme_reply = false     # 被@检测与回复（「与我相关」接口，v1.3.0）
+atme_poll_count = 10          # 每轮拉取「与我相关」条数（1~20）
+atme_max_replies_per_run = 5  # 单轮被@回复上限
 interval_min = 30             # 循环间隔（分钟）
 silent_hours = "23:00-07:30"  # 静默时段（支持跨零点，逗号分隔多段）
 like_probability = 0.9
 comment_probability = 0.6
 ```
+
+### 被@检测与回复（v1.3.0，`enable_atme_reply = true` 开启）
+
+每轮自动任务调「与我相关」接口（`feeds2_html_pav_all`，g_tk 用 **p_skey 版**），
+按官方渲染文案分类动作：
+
+- **mention（正文@我）** → 评论该说说
+- **comment_mention（评论@我）** → 经 msglist_v6 定位互动者在说说下含 `@`/bot昵称
+  的最新评论并回评；说说不在对方最近 10 条动态内或定位不到评论时，降级为评论说说
+- **other（赞/评论/回复/访问）** → 忽略（自己说说被评论由「自动回评」负责）
+
+去重 key `atme:{post_uin}:{post_tid}` 走 `processed_list.json`：同一说说上的
+多次 @/赞/评论合并为一次唤醒；先标记后处理，回复失败不重试（防风控优先于送达率）。
+回复内容走与自动回评相同的 LLM 净化链（剥 markdown、拒答拦截、身份错位拦截）。
 
 ## 依赖与登录态
 
