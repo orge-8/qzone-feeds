@@ -93,7 +93,7 @@ comment_probability = 0.6
 
 ## 依赖与登录态
 
-- 硬依赖 **napcat-adapter**：cookie 通过 `adapter.napcat.account.get_cookies` 自动获取，无需扫码
+- 硬依赖 **maibot-team.snowluma-adapter >= 1.0.0**（v1.3.0 起 SnowLuma 连接器合并 NapCat 适配器，`adapter.napcat.*` API 前缀不变）：cookie 通过 `adapter.napcat.account.get_cookies` 自动获取，无需扫码。注意 QZone API 组仅 `client_type=snowluma` 支持，但本插件只依赖账号组 `get_cookies`，napcat 画像下同样可用
 - python 依赖：httpx / bs4 / json5 / pillow（manifest 已声明）
 
 ## 架构
