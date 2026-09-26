@@ -93,6 +93,34 @@ def looks_like_refusal(text: str) -> bool:
     return any(m in t for m in _REFUSAL_MARKERS)
 
 
+# 身份错位特征（v1.2.9 事故）：自动评论是发在**好友**的动态下，好友不是 bot 的主人。
+# 真机事故（2026-09-26）：好友动态「第一次做bot」→ bot 评论
+#   「嘿嘿，谁让你把我调教得这么厉害的，认输吧主人[得意]」
+# —— LLM 顺着动态原文入戏，把发动态的好友当成了自己的主人。
+# 发布出去等于 bot 在好友空间公开认错了爹，属公开事故；与拒答同哲学 fail-closed。
+_IDENTITY_MARKERS = (
+    "主人",
+    "主人酱",
+    "我的主人",
+    "master",
+    "Master",
+)
+
+
+def looks_like_identity_confusion(text: str) -> bool:
+    """评论是否把好友误认成了主人/创造了 bot 的人（身份错位）。
+
+    自动评论场景下，评论对象永远是 bot 主人的**好友**——对好友称「主人」
+    无论上下文多顺都是身份错位。命中即跳过评论（fail-closed）：
+    误拦只是少一条评论，错发是「bot 认错主人」的公开事故。
+    注意：只拦「主人」类称呼，不拦「老板」「大佬」等常规调侃称呼。
+    """
+    if not text:
+        return False
+    t = str(text)
+    return any(m in t for m in _IDENTITY_MARKERS)
+
+
 def sanitize_llm_output(text, max_chars: int = _MAX_PUBLISH_CHARS) -> str:
     """LLM 输出发布前净化：剥引号包裹、去 markdown 装饰、硬截断。
 
@@ -264,6 +292,12 @@ class ReplyManager:
                     if looks_like_refusal(reply_message):
                         # 拒答文本绝不能发布（会变成 bot 公开教训好友）
                         logger.warning(f"LLM 返回拒答内容，已跳过回复: {reply_message[:50]}")
+                        await self._store.mark_processed(fid, comment["comment_tid"])
+                        continue
+                    if looks_like_identity_confusion(reply_message):
+                        # 身份错位文本绝不能发布——评论者是好友不是主人，
+                        # 对好友称「主人」等于 bot 公开认错爹（2026-09-26 事故）
+                        logger.warning(f"LLM 称呼好友为主人（身份错位），已跳过回复: {reply_message[:50]}")
                         await self._store.mark_processed(fid, comment["comment_tid"])
                         continue
                     result = await api.reply(

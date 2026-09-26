@@ -1344,6 +1344,61 @@ def test_refusal_detection():
         check("M04 拒答特征单点命中（4/4）", True)
 
 
+# ============================================================
+# M2. 身份错位拦截（真机事故 2026-09-26：bot 对好友称「主人」）
+# ============================================================
+_IDENTITY_SAMPLES = [
+    "嘿嘿，谁让你把我调教得这么厉害的，认输吧主人[得意]",  # 09-26 真机原文
+    "主人你好厉害呀",
+    "我的主人最棒了",
+    "master 威武",
+]
+
+
+def test_identity_confusion_detection():
+    section("M2. 身份错位拦截（好友≠主人）")
+    f = reply_manager.looks_like_identity_confusion
+
+    for i, s in enumerate(_IDENTITY_SAMPLES, 1):
+        check(f"M2.1-{i} 身份错位命中: {s[:20]}", f(s) is True)
+
+    ok_samples = [
+        "哈哈咋了这是？被队友气到不想碰王者啦？",
+        "大佬这操作也太秀了吧！",       # 常规调侃称呼不误伤
+        "老板何时更新呀，蹲一个",        # 同上
+        "第一次做bot就有这水平，不错哦",  # 动态谈 bot 本身不误伤
+        "这图也太好看了吧，求出处！",
+    ]
+    bad = [s for s in ok_samples if f(s)]
+    check("M2.2 正常评论/常规称呼不误判", not bad, f"误判：{bad}" if bad else "全部正常")
+    check("M2.3 空文本不误判", f("") is False and f(None) is False)
+
+
+async def test_identity_confusion_not_published():
+    """M2.4~M2.6：身份错位文本不得产生评论/回复副作用（与拒答同路径拦截）。"""
+    section("M2. 身份错位不发布")
+    at = auto_tasks
+    orig = at._llm_generate
+
+    async def identity_llm(plugin, prompt):
+        return _IDENTITY_SAMPLES[0]
+
+    at._llm_generate = identity_llm
+    try:
+        base = {"target_qq": "20001", "videos": [], "comments": []}
+        store, api = _FakeStore(), _FakeApi()
+        await at.process_feeds(None, api, store,
+                               [{**base, "tid": "i1", "content": "第一次做bot",
+                                 "rt_con": "", "images": []}],
+                               like_probability=1.0, comment_probability=1.0,
+                               action_interval=0)
+        check("M2.4 身份错位时不发评论", not api.comments,
+              f"却发了：{api.comments[:1]}" if api.comments else "已拦截")
+        check("M2.5 身份错位时点赞仍执行", api.likes == ["i1"], f"likes={api.likes}")
+    finally:
+        at._llm_generate = orig
+
+
 async def test_refusal_not_published():
     """M05~M07：拒答文本不得产生评论/回复副作用。"""
     section("M. 拒答不发布")
@@ -1596,6 +1651,8 @@ async def _amain():
     await test_refusal_not_published()
     await test_singleflight_dedup()
     await test_hash_cache_url_rotation()
+    test_identity_confusion_detection()
+    await test_identity_confusion_not_published()
     test_manifest()
 
 
