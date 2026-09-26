@@ -10,7 +10,8 @@ import datetime
 import random
 
 from .person_context import fetch_person_context
-from .reply_manager import _llm_generate, looks_like_refusal, sanitize_llm_output
+from .reply_manager import (_llm_generate, looks_like_refusal,
+                            looks_like_identity_confusion, sanitize_llm_output)
 
 
 class NoLogger:
@@ -83,6 +84,8 @@ def _is_in_silent_period(silent_hours_config: str) -> bool:
 _DEFAULT_COMMENT_PROMPT = (
     "好友{target_name}发了说说：{content}。"
     "请以 bot 身份写一条自然的评论，口语化、不超过40字、只输出评论内容。"
+    "注意：{target_name}是你的好友，不是你的主人/创造者/调教者，"
+    "即使TA的动态在谈论制作 bot 或 AI，也不要把TA当成自己的主人。"
 )
 
 # 画像注入说明（{target_profile} 非空时插入，空时整个提示消失）
@@ -180,6 +183,11 @@ async def process_feeds(
                 if comment_text and looks_like_refusal(comment_text):
                     # 拒答文本绝不能发布——会变成 bot 在好友空间里公开"教训"对方
                     logger.warning(f"LLM 返回拒答内容，跳过评论 {fid}: {comment_text[:50]}")
+                    comment_text = ""
+                if comment_text and looks_like_identity_confusion(comment_text):
+                    # 身份错位文本绝不能发布——评论对象是好友不是主人，
+                    # 「认输吧主人」类评论等于 bot 公开认错爹（2026-09-26 事故）
+                    logger.warning(f"LLM 称呼好友为主人（身份错位），跳过评论 {fid}: {comment_text[:50]}")
                     comment_text = ""
                 if comment_text:
                     ok = await api.comment(fid, target_qq, comment_text)
