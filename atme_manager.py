@@ -16,9 +16,11 @@ v1.3.0 新增。与 reply_manager（自己说说被评论）互补：
 """
 
 import asyncio
+import datetime
 import random
 
-from .reply_manager import (_llm_generate, looks_like_identity_confusion,
+from .reply_manager import (_llm_generate, format_comment_time,
+                            looks_like_identity_confusion,
                             looks_like_refusal, sanitize_llm_output)
 
 
@@ -46,8 +48,10 @@ def set_atme_manager_logger(custom_logger):
 
 _DEFAULT_ATME_PROMPT = (
     "你是{bot_name}，你在QQ空间被好友@了。"
-    "说说内容：{post}；互动者：{nickname}；相关内容：{mention_content}。"
+    "说说内容：{post}；互动者：{nickname}；相关内容：{mention_content}；"
+    "互动时间：{created_time}；当前时间：{current_time}。"
     "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"
+    "留意互动时间与当前时间的间隔，别把几天前的@当成刚发的。"
 )
 
 
@@ -133,19 +137,46 @@ class AtmeManager:
         # comment_mention：定位该互动者在说说下含 @/bot昵称 的最新评论（倒序找）
         reply_target = None
         post_content = mention_content
+        created_time_raw = item.get("time", "")
         if is_comment_mention:
             located = await self._locate_mention_comment(api, post_uin, post_tid,
                                                          actor_uin, bot_name)
             if located is not None:
                 reply_target = located
                 post_content = located["post_content"] or mention_content
+                # 定位到的评论时间更精确，优先采用；缺失则退回条目 abstime
+                created_time_raw = located.get("created_time") or created_time_raw
 
-        prompt = prompt_tpl.format(
-            bot_name=bot_name,
-            post=post_content,
-            nickname=nickname,
-            mention_content=mention_content,
-        )
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        created_time_str = format_comment_time(created_time_raw)
+        try:
+            prompt = prompt_tpl.format(
+                bot_name=bot_name,
+                post=post_content,
+                nickname=nickname,
+                mention_content=mention_content,
+                created_time=created_time_str,
+                current_time=now_str,
+                now_time=now_str,
+            )
+            # 旧版模板（config.toml 已落盘不随插件升级更新）缺时间占位符时补齐
+            missing = []
+            if "{created_time}" not in prompt_tpl:
+                missing.append(f"互动时间：{created_time_str}")
+            if "{current_time}" not in prompt_tpl and "{now_time}" not in prompt_tpl:
+                missing.append(f"当前时间：{now_str}")
+            if missing:
+                prompt += ("（" + "；".join(missing)
+                           + "。请留意互动时间与当前时间的间隔，别把几天前的@当成刚发的。）")
+        except (KeyError, IndexError):
+            # 模板占位符不匹配时回退默认模板（也带时间上下文）
+            prompt = (
+                f"你是{bot_name}，你在QQ空间被好友@了。"
+                f"说说内容：{post_content}；互动者：{nickname}；相关内容：{mention_content}；"
+                f"互动时间：{created_time_str}；当前时间：{now_str}。"
+                "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"
+                "留意互动时间与当前时间的间隔，别把几天前的@当成刚发的。"
+            )
         reply_message = sanitize_llm_output(await _llm_generate(self._plugin, prompt))
         if not reply_message:
             logger.warning("被@回复内容为空，跳过")
@@ -200,6 +231,9 @@ class AtmeManager:
                 located = {
                     "comment_tid": comment.get("comment_tid"),
                     "post_content": str(feed.get("content", "") or ""),
+                    # 定位到的评论自带时间（get_list 归一化字段），
+                    # 优先于「与我相关」条目的 abstime（前者更精确）
+                    "created_time": comment.get("created_time", ""),
                 }
                 break
         if located is None or not located["comment_tid"]:

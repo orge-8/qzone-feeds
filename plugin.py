@@ -135,9 +135,12 @@ class ReplyConfig(PluginConfigBase):
     reply_interval_sec: int = Field(default=3, description="两条回复之间的基础间隔秒数")
     prompt: str = Field(
         default=("你是{bot_name}，你在QQ空间自己的说说下收到了评论。"
-                 "说说内容：{content}；评论者：{nickname}；评论内容：{comment_content}；评论时间：{created_time}。"
-                 "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"),
-        description="回复评论的LLM提示词模板",
+                 "说说内容：{content}；评论者：{nickname}；评论内容：{comment_content}；"
+                 "评论时间：{created_time}；当前时间：{current_time}。"
+                 "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"
+                 "留意评论时间与当前时间的间隔，别把几天前的评论当成刚发的。"),
+        description="回复评论的LLM提示词模板（可用 {bot_name} {content} {nickname} "
+                    "{comment_content} {created_time} {current_time}）",
     )
 
 
@@ -167,9 +170,12 @@ class AutoConfig(PluginConfigBase):
     atme_max_replies_per_run: int = Field(default=5, description="单轮被@回复上限")
     atme_prompt: str = Field(
         default=("你是{bot_name}，你在QQ空间被好友@了。"
-                 "说说内容：{post}；互动者：{nickname}；相关内容：{mention_content}。"
-                 "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"),
-        description="被@回复的LLM提示词模板（可用 {bot_name} {post} {nickname} {mention_content}）")
+                 "说说内容：{post}；互动者：{nickname}；相关内容：{mention_content}；"
+                 "互动时间：{created_time}；当前时间：{current_time}。"
+                 "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"
+                 "留意互动时间与当前时间的间隔，别把几天前的@当成刚发的。"),
+        description="被@回复的LLM提示词模板（可用 {bot_name} {post} {nickname} "
+                    "{mention_content} {created_time} {current_time}）")
 
 
 class QueueConfig(PluginConfigBase):
