@@ -11,6 +11,7 @@ import asyncio
 import datetime
 import random
 import re
+import time
 
 
 class NoLogger:
@@ -119,6 +120,33 @@ def looks_like_identity_confusion(text: str) -> bool:
         return False
     t = str(text)
     return any(m in t for m in _IDENTITY_MARKERS)
+
+
+def format_comment_time(raw) -> str:
+    """把评论文本时间格式化为可读时间，供 prompt 注入。
+
+    两条取评论路径的 created_time 格式不同：
+    - JSON 路径（get_list，回评用）：原始 createTime，多为 unix 时间戳串
+    - HTML 路径（get_qzone_list）：span.state 文本，形如 "3小时前"/"昨天 10:23"
+
+    时间戳 → "YYYY-MM-DD HH:MM:SS"（本地时区，与真实谈天时间对齐）；
+    已是可读文本 → 原样返回；缺失/无法解析 → "未知"。
+    绝不返回空串：prompt 里出现"评论时间：；"会让 LLM 以为时间信息被吞了。
+    """
+    if raw is None:
+        return "未知"
+    s = str(raw).strip()
+    if not s:
+        return "未知"
+    if s.isdigit():
+        try:
+            num = int(s)
+            if num > 10_000_000_000:  # 13 位毫秒时间戳 → 秒
+                num //= 1000
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(num))
+        except (ValueError, OverflowError, OSError):
+            return s
+    return s
 
 
 def sanitize_llm_output(text, max_chars: int = _MAX_PUBLISH_CHARS) -> str:
@@ -266,21 +294,39 @@ class ReplyManager:
                 await asyncio.sleep(interval_base + random.random())
                 comment_qq = str(comment.get("qq_account", ""))
                 try:
-                    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    comment_time_str = format_comment_time(comment.get("created_time"))
                     try:
                         prompt = prompt_tpl.format(
                             bot_name=bot_name,
                             content=content,
                             nickname=comment.get("nickname", "好友"),
                             comment_content=comment.get("content", ""),
-                            created_time=comment.get("created_time", "") or current_time,
+                            # created_time：该评论的发布时间（已格式化）
+                            created_time=comment_time_str,
+                            # current_time / now_time：当前时间，供 LLM 判断"这条评论是多久前发的"
+                            current_time=now_str,
+                            now_time=now_str,
                         )
+                        # 旧版模板可能不含时间占位符（config.toml 已落盘不会随插件升级更新），
+                        # 缺什么补什么——否则升级后老配置拿不到时间上下文
+                        missing = []
+                        if "{created_time}" not in prompt_tpl:
+                            missing.append(f"评论时间：{comment_time_str}")
+                        if "{current_time}" not in prompt_tpl and "{now_time}" not in prompt_tpl:
+                            missing.append(f"当前时间：{now_str}")
+                        if missing:
+                            prompt += ("（" + "；".join(missing)
+                                       + "。请留意评论时间与当前时间的间隔，"
+                                         "别把几天前的评论当成刚发的。）")
                     except (KeyError, IndexError):
-                        # 模板占位符不匹配时回退默认模板
+                        # 模板占位符不匹配时回退默认模板（也带时间上下文）
                         prompt = (
                             f"你在QQ空间自己的说说「{content}」下收到评论。"
-                            f"评论者：{comment.get('nickname', '好友')}；评论内容：{comment.get('content', '')}。"
+                            f"评论者：{comment.get('nickname', '好友')}；评论内容：{comment.get('content', '')}；"
+                            f"评论时间：{comment_time_str}；当前时间：{now_str}。"
                             "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"
+                            "留意评论时间与当前时间的间隔，别把几天前的评论当成刚发的。"
                         )
                     logger.info(f"正在回复 {comment.get('nickname')} 的评论: {comment.get('content', '')[:30]}")
                     reply_message = sanitize_llm_output(await _llm_generate(self._plugin, prompt))
