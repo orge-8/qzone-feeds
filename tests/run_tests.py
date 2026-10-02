@@ -15,6 +15,7 @@ import json
 import re
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -66,6 +67,7 @@ qzone_api = importlib.import_module("qzf.qzone_api")
 cookie_manager = importlib.import_module("qzf.cookie_manager")
 processed_store = importlib.import_module("qzf.processed_store")
 reply_manager = importlib.import_module("qzf.reply_manager")
+atme_manager = importlib.import_module("qzf.atme_manager")
 auto_tasks = importlib.import_module("qzf.auto_tasks")
 vision = importlib.import_module("qzf.vision")
 image_compress = importlib.import_module("qzf.image_compress")
@@ -179,7 +181,17 @@ def test_compress_fallback():
         has_pil = True
     except ImportError:
         has_pil = False
-    out = image_compress.compress_image_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 100)
+    if has_pil:
+        # 旧夹具（PNG头+全零）不是合法图片：装了 Pillow 反而解码失败返回 None，
+        # A25 断言恒假。改为现场生成一张真 PNG（有 Pillow 的分支必然可用）。
+        import io
+        from PIL import Image as _Image
+        buf = io.BytesIO()
+        _Image.new("RGB", (64, 48), (120, 60, 30)).save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+    else:
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+    out = image_compress.compress_image_bytes(png_bytes)
     if has_pil:
         check("A25 压缩可用（Pillow 已装）", out is not None)
     else:
@@ -1472,6 +1484,115 @@ async def test_refusal_not_published():
         reply_manager._llm_generate = orig2
 
 
+# ============================================================
+# N. 回评时间上下文（该评论时间 + 当前时间）v1.2.10
+# ============================================================
+def test_format_comment_time():
+    section("N. 评论时间格式化")
+    f = reply_manager.format_comment_time
+
+    # unix 时间戳（秒）→ 可读本地时间
+    ts = 1758880000
+    expect = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    check("N01 秒级时间戳 → 可读时间", f(str(ts)) == expect, f"{f(str(ts))!r} vs {expect!r}")
+    check("N02 int 时间戳同样处理", f(ts) == expect, f"{f(ts)!r}")
+    # 毫秒时间戳（13 位）兼容
+    check("N03 毫秒时间戳正确换算", f(str(ts * 1000)) == expect, f"{f(str(ts * 1000))!r}")
+    # 已是可读文本（HTML 路径 span.state）原样保留
+    for s in ["3小时前", "昨天 10:23", "09-26 10:23", "2026-09-26 10:23:00"]:
+        check(f"N04 可读文本原样保留: {s}", f(s) == s, f"{f(s)!r}")
+    # 缺失/异常 → "未知"（绝不返回空串，避免 prompt 出现"评论时间：；"）
+    check("N05 缺失/空 → 未知",
+          f(None) == "未知" and f("") == "未知" and f("   ") == "未知",
+          f"{f(None)!r},{f('')!r},{f('   ')!r}")
+    # 超范围时间戳不抛异常
+    check("N06 异常大值不抛异常", isinstance(f("99999999999999999999"), str),
+          f"{f('99999999999999999999')!r}")
+
+
+async def test_reply_prompt_time_context():
+    """N07~N10：回评 prompt 必须含该评论时间与当前时间。"""
+    section("N. 回评 prompt 时间上下文")
+    orig = reply_manager._llm_generate
+    captured = {}
+
+    async def capture_llm(plugin, prompt):
+        captured["prompt"] = prompt
+        return "收到啦"
+
+    reply_manager._llm_generate = capture_llm
+    ts = 1758880000
+    ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+    class _Store:
+        async def is_processed(self, fid, tid=None):
+            return False
+
+        async def mark_processed(self, fid, tid=None):
+            return True
+
+    class _Api:
+        uin = "10001"
+        qq_nickname = "鸣澜"
+
+        def __init__(self):
+            self.replies = []
+
+        async def get_list(self, *a, **kw):
+            return [{"tid": "f1", "target_qq": "10001", "content": "今天天气不错",
+                     "images": [], "comments": [
+                         {"qq_account": "20001", "nickname": "友", "content": "确实",
+                          "comment_tid": 111, "created_time": str(ts)}]}]
+
+        async def reply(self, *a, **kw):
+            self.replies.append(a)
+            return True
+
+    def _mk_plugin(prompt_tpl):
+        class _P:
+            class config:
+                class reply:
+                    scan_count = 5
+                    max_replies_per_run = 10
+                    reply_interval_sec = 0
+                    prompt = prompt_tpl
+        return _P()
+
+    try:
+        # N07 默认模板（含 {created_time}/{current_time}）
+        default_tpl = plugin.QzoneFeedsConfig().reply.prompt
+        api = _Api()
+        await reply_manager.ReplyManager(_mk_plugin(default_tpl), _Store()).reply_new_comments(api)
+        p = captured.get("prompt", "")
+        today = time.strftime("%Y-%m-%d")
+        check("N07 默认模板含评论时间（已格式化）", ts_str in p, f"prompt={p[:180]!r}")
+        check("N08 默认模板含当前时间",
+              f"当前时间：{today}" in p, f"prompt={p[:180]!r}")
+
+        # N09 旧模板（无时间占位符）→ 自动补偿追加
+        old_tpl = "你是{bot_name}。说说：{content}；评论者：{nickname}；评论：{comment_content}"
+        api2 = _Api()
+        await reply_manager.ReplyManager(_mk_plugin(old_tpl), _Store()).reply_new_comments(api2)
+        p2 = captured.get("prompt", "")
+        check("N09 旧模板自动补偿时间上下文",
+              ts_str in p2 and "当前时间" in p2 and p2.startswith("你是鸣澜"),
+              f"prompt={p2[:220]!r}")
+
+        # N10 模板含 created_time 但缺 current_time → 只补当前时间（不重复补评论时间）
+        part_tpl = ("你是{bot_name}。说说：{content}；评论者：{nickname}；"
+                    "评论：{comment_content}；评论时间：{created_time}")
+        api3 = _Api()
+        await reply_manager.ReplyManager(_mk_plugin(part_tpl), _Store()).reply_new_comments(api3)
+        p3 = captured.get("prompt", "")
+        # 评论时间值只出现一次（模板占位符替换），补偿里不含
+        check("N10 缺 current_time 时只补当前时间",
+              p3.count(ts_str) == 1 and "当前时间：" in p3
+              and "评论时间：" in p3 and f"当前时间：{today}" in p3,
+              f"prompt={p3[:240]!r}")
+    finally:
+        reply_manager._llm_generate = orig
+
+
 def test_manifest():
     section("F. Manifest")
     m = json.loads((Path(PLUGIN_DIR) / "_manifest.json").read_text(encoding="utf-8"))
@@ -1489,8 +1610,8 @@ def test_manifest():
     check("F15 capabilities 覆盖 send/llm/api",
           need.issubset(set(caps)), str(caps))
     deps = {d.get("id") or d.get("name") for d in m.get("dependencies", [])}
-    check("F16 依赖声明含 napcat-adapter/httpx/json5/bs4/pillow",
-          {"maibot-team.napcat-adapter", "httpx", "json5",
+    check("F16 依赖声明含 snowluma-adapter/httpx/json5/bs4/pillow",
+          {"maibot-team.snowluma-adapter", "httpx", "json5",
            "beautifulsoup4", "pillow"}.issubset(deps), str(deps))
     gi = (Path(PLUGIN_DIR) / ".gitignore").read_text(encoding="utf-8")
     check("F17 .gitignore 含 config.toml", "config.toml" in gi)
@@ -1615,6 +1736,220 @@ async def test_hash_cache_url_rotation():
 
 
 # ============================================================
+# P. 被@检测（v1.3.0：「与我相关」接口解析与回复流程）
+# ============================================================
+async def test_atme_detection():
+    section("P. 被@检测（feeds2_html_pav_all）")
+    am = atme_manager
+    qa = qzone_api
+
+    # ── 动作分类（纯函数，长词优先防子串误判） ──
+    cls = qa._classify_atme_action
+    check("P01 '评论提到我'优先于'提到我'", cls("某某 评论提到我 内容") == "comment_mention")
+    check("P02 '提到我'→mention", cls("某某 提到我 说说内容") == "mention")
+    check("P03 赞/评论/访问→other",
+          cls("某某 赞了我的说说") == "other" and cls("某某 评论 了") == "other"
+          and cls("某某 访问了我的主页") == "other")
+
+    # ── 条目归一化：mood 链接提取 + tid 锚点截断 + 脏条目跳过 ──
+    items = qa.parse_atme_items({"data": {"data": [
+        {"uin": "20001", "nickname": "友", "appid": "311", "abstime": 1790404744,
+         "html": "<a href=\"http://user.qzone.qq.com/10001/mood/abc1230100.\">友 提到我</a>"},
+        {"uin": "20002", "nickname": "乙", "appid": "403", "abstime": 1790400000,
+         "html": "乙 访问了我的主页"},
+        "junk",
+    ]}})
+    check("P04 mood链接提取tid并截断锚点",
+          items and items[0]["post_uin"] == "10001"
+          and items[0]["post_tid"] == "abc1230100" and items[0]["action"] == "mention",
+          f"items[0]={items[0] if items else None}")
+    check("P05 无mood链接→None + 非dict条目跳过",
+          len(items) == 2 and items[1]["post_tid"] is None and items[1]["action"] == "other")
+
+    # ── get_atme_list：JSONP + JS 字面量 + undefined + 登录失效 ──
+    import httpx as _httpx
+    js_body = ("_Callback({code:0,subcode:0,message:'',data:{main:{total_number:2},data:["
+               "{uin:'20001',nickname:'友',appid:'311',abstime:'1790404744',"
+               "html:'<a href=\"http://user.qzone.qq.com/10001/mood/abc0100.\">友 提到我</a>'},"
+               "{uin:'20002',nickname:'乙',appid:'403',abstime:'1790400000',"
+               "html:'乙 访问了我的主页'},undefined]}});")
+
+    async def handler_ok(request):
+        if "feeds2_html_pav_all" in str(request.url):
+            return _httpx.Response(200, text=js_body)
+        return _httpx.Response(404)
+
+    api = qa.QzoneAPI({"uin": "10001", "p_skey": "x"})
+    api._client = _httpx.AsyncClient(transport=_httpx.MockTransport(handler_ok))
+    got = await api.get_atme_list()
+    await api.aclose()
+    check("P06 JSONP+JS字面量解析与undefined跳过",
+          len(got) == 2 and got[0]["action"] == "mention" and got[0]["post_tid"] == "abc0100",
+          f"got={got}")
+
+    async def handler_expired(request):
+        return _httpx.Response(200, text="_Callback({code:1000000,message:'请先登录'});")
+
+    api_exp = qa.QzoneAPI({"uin": "10001", "p_skey": "x"})
+    api_exp._client = _httpx.AsyncClient(transport=_httpx.MockTransport(handler_expired))
+    raised = False
+    try:
+        await api_exp.get_atme_list()
+    except qa.CookieExpiredError:
+        raised = True
+    await api_exp.aclose()
+    check("P07 登录失效抛CookieExpiredError", raised)
+
+    # ── 回复流程：mention→评论；comment_mention→定位回评；去重；守卫 ──
+    class _AtmeStore:
+        def __init__(self):
+            self.seen = set()
+
+        async def is_processed(self, fid, tid=None):
+            return fid in self.seen
+
+        async def mark_processed(self, fid, tid=None):
+            self.seen.add(fid)
+            return True
+
+    class _AtmeApi:
+        uin = "10001"
+        qq_nickname = "鸣澜bot"
+
+        def __init__(self, items, feed=None):
+            self._items = items
+            self._feed = feed
+            self.comments = []
+            self.replies = []
+
+        async def get_atme_list(self, count=10):
+            return self._items
+
+        async def get_list(self, *a, **kw):
+            return [self._feed] if self._feed else []
+
+        async def comment(self, fid, target_qq, content):
+            self.comments.append((fid, target_qq, content))
+            return True
+
+        async def reply(self, fid, target_qq, nick, cqq, content, ctid):
+            self.replies.append((fid, target_qq, cqq, ctid, content))
+            return True
+
+    atme_items = [
+        {"action": "mention", "uin": "20001", "nickname": "友",
+         "post_uin": "20001", "post_tid": "t1", "content": "友 提到我"},
+        {"action": "comment_mention", "uin": "20002", "nickname": "乙",
+         "post_uin": "20002", "post_tid": "t2", "content": "乙 评论提到我"},
+        {"action": "other", "uin": "20003", "nickname": "丙",
+         "post_uin": "10001", "post_tid": "ownpost", "content": "丙 赞了我的说说"},
+        {"action": "mention", "uin": "20004", "nickname": "丁",
+         "post_uin": "10001", "post_tid": "selfpost", "content": "丁 提到我"},
+    ]
+    feed_t2 = {"tid": "t2", "target_qq": "20002", "content": "某说说", "comments": [
+        {"qq_account": "20002", "nickname": "乙", "content": "@鸣澜bot 来玩",
+         "comment_tid": 777}]}
+
+    plugin = _AutoPlugin(auto_kw={"enable_atme_reply": True, "reply_interval_sec": 0})
+    mgr = am.AtmeManager(plugin, _AtmeStore())
+    orig_llm = am._llm_generate
+
+    async def ok_llm(p, prompt):
+        return "哈哈你好呀"
+
+    am._llm_generate = ok_llm
+    try:
+        api3 = _AtmeApi(atme_items, feed_t2)
+        ok, msg = await mgr.reply_atme_mentions(api3)
+        check("P08 mention→评论说说",
+              ok and api3.comments and api3.comments[0][0] == "t1",
+              f"comments={api3.comments}")
+        check("P09 comment_mention→定位原评论回评",
+              bool(api3.replies) and api3.replies[0][3] == 777,
+              f"replies={api3.replies}")
+        check("P10 other与自己的说说被忽略",
+              len(api3.comments) == 1 and len(api3.replies) == 1)
+        api4 = _AtmeApi(atme_items, feed_t2)
+        await mgr.reply_atme_mentions(api4)
+        check("P11 同一说说只处理一次（seen-key 去重）",
+              not api4.comments and not api4.replies)
+
+        # 拒答守卫
+        async def refusal_llm(p, prompt):
+            return "抱歉，我不能按照你的要求进行创作"
+
+        am._llm_generate = refusal_llm
+        mgr2 = am.AtmeManager(plugin, _AtmeStore())
+        api5 = _AtmeApi([atme_items[0]], None)
+        await mgr2.reply_atme_mentions(api5)
+        check("P12 拒答不发布被@回复", not api5.comments and not api5.replies)
+
+        # 身份错位守卫
+        async def identity_llm(p, prompt):
+            return "嘿嘿，认输吧主人[得意]"
+
+        am._llm_generate = identity_llm
+        mgr3 = am.AtmeManager(plugin, _AtmeStore())
+        api6 = _AtmeApi([atme_items[0]], None)
+        await mgr3.reply_atme_mentions(api6)
+        check("P13 身份错位不发布被@回复", not api6.comments and not api6.replies)
+    finally:
+        am._llm_generate = orig_llm
+
+    # ── comment_mention 定位失败降级为评论说说 ──
+    am._llm_generate = ok_llm
+    try:
+        plugin4 = _AutoPlugin(auto_kw={"enable_atme_reply": True, "reply_interval_sec": 0})
+        mgr4 = am.AtmeManager(plugin4, _AtmeStore())
+        cm_item = {"action": "comment_mention", "uin": "20002", "nickname": "乙",
+                   "post_uin": "20002", "post_tid": "not_in_list", "content": "乙 评论提到我"}
+        api7 = _AtmeApi([cm_item], feed_t2)  # feed tid=t2 ≠ not_in_list → 定位失败
+        await mgr4.reply_atme_mentions(api7)
+        check("P14 定位不到评论→降级评论说说",
+              len(api7.comments) == 1 and not api7.replies,
+              f"comments={api7.comments} replies={api7.replies}")
+    finally:
+        am._llm_generate = orig_llm
+
+    # ── P15~P17 被@回复的时间上下文（v1.3.2） ──
+    captured = {}
+
+    async def capture_llm(p, prompt):
+        captured["prompt"] = prompt
+        return "收到啦"
+
+    am._llm_generate = capture_llm
+    try:
+        ts = 1790404744
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        today = time.strftime("%Y-%m-%d")
+        item_t = {"action": "mention", "uin": "20001", "nickname": "友",
+                  "post_uin": "20001", "post_tid": "t9", "content": "友 提到我",
+                  "time": str(ts)}
+        plugin5 = _AutoPlugin(auto_kw={"enable_atme_reply": True, "reply_interval_sec": 0})
+        api8 = _AtmeApi([item_t], None)
+        await am.AtmeManager(plugin5, _AtmeStore()).reply_atme_mentions(api8)
+        p = captured.get("prompt", "")
+        check("P15 被@回复 prompt 含互动时间（时间戳→可读）",
+              ts_str in p, f"prompt={p[:200]!r}")
+        check("P16 被@回复 prompt 含当前时间",
+              f"当前时间：{today}" in p, f"prompt={p[:200]!r}")
+
+        # 旧模板（无时间占位符）→ 自动补偿
+        old_atme_tpl = "你是{bot_name}。说说：{post}；互动者：{nickname}；内容：{mention_content}"
+        plugin6 = _AutoPlugin(auto_kw={"enable_atme_reply": True, "reply_interval_sec": 0,
+                                       "atme_prompt": old_atme_tpl})
+        api9 = _AtmeApi([item_t], None)
+        await am.AtmeManager(plugin6, _AtmeStore()).reply_atme_mentions(api9)
+        p2 = captured.get("prompt", "")
+        check("P17 被@旧模板自动补偿时间上下文",
+              p2.startswith("你是鸣澜bot") and ts_str in p2 and "当前时间" in p2,
+              f"prompt={p2[:220]!r}")
+    finally:
+        am._llm_generate = orig_llm
+
+
+# ============================================================
 # main
 # ============================================================
 async def _amain():
@@ -1653,6 +1988,9 @@ async def _amain():
     await test_hash_cache_url_rotation()
     test_identity_confusion_detection()
     await test_identity_confusion_not_published()
+    await test_atme_detection()
+    test_format_comment_time()
+    await test_reply_prompt_time_context()
     test_manifest()
 
 
