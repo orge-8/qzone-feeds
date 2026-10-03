@@ -13,6 +13,9 @@ import random
 import re
 import time
 
+from .comment_style import (append_style_guard, build_style_retry_prompt,
+                            looks_like_skip, looks_like_stiff_register)
+
 
 class NoLogger:
     def info(self, msg):
@@ -204,6 +207,67 @@ async def _llm_generate(plugin, prompt: str) -> str:
         return ""
 
 
+async def _one_comment_attempt(plugin, prompt: str) -> tuple[str, str]:
+    """单次生成 + 全部发布前检查。
+
+    Returns:
+        (text, reason)——text 非空表示"可发布"且已净化；
+        text 为空串 + reason 表示"不要发布"，reason 供日志诊断：
+        empty / llm_skip / refusal / identity / stiff
+    """
+    raw = await _llm_generate(plugin, append_style_guard(prompt))
+    if not raw:
+        return "", "empty"
+    # 弃评标记在净化**之前**判：净化会剥引号，万一模型写成「"[跳过]"」也能认出来
+    if looks_like_skip(raw):
+        return "", "llm_skip"
+    text = sanitize_llm_output(raw)
+    if not text:
+        return "", "empty"
+    if looks_like_refusal(text):
+        # 拒答文本绝不能发布（会变成 bot 公开教训好友）
+        return "", "refusal"
+    if looks_like_identity_confusion(text):
+        # 身份错位文本绝不能发布——评论对象是好友不是主人（2026-09-26 事故）
+        return "", "identity"
+    if looks_like_stiff_register(text):
+        # 书面通稿腔（2026-10-03 事故）。带文本返回，供调用方重写时当反例
+        return text, "stiff"
+    return text, "ok"
+
+
+async def generate_guarded_comment(plugin, prompt: str) -> tuple[str, str]:
+    """生成一条**可发布**的评论/回复文本，带语域纪律与 fail-closed 拦截。
+
+    三条生成路径（自动评论 / 回评自己说说的评论 / 被@回复）共用本函数，
+    保证纪律一致——只在某一条路径上修，等于没修。
+
+    处理顺序（每一步都不可省）：
+    1. 追加代码级发言纪律（见 comment_style 模块头，绕开用户模板）；
+    2. 生成 → 弃评标记 / 净化 / 拒答 / 身份错位 / 语域 逐项检查；
+    3. 语域不合格时给**一次**重写机会（把不合格句当反例回灌）；
+    4. 重写仍不合格 → 放弃发布（宁可少一条评论，不发通稿腔）。
+
+    Returns:
+        (text, reason)：text 为空串表示"不要发布"；非空即可直接调发布 API。
+    """
+    text, reason = await _one_comment_attempt(plugin, prompt)
+    if reason != "stiff":
+        if reason == "llm_skip":
+            logger.info("LLM 主动弃评（读不懂/接不上），本条不评论")
+        return text, reason
+
+    logger.warning(f"评论语域不合格（书面通稿腔），尝试重写: {text[:40]}")
+    text2, reason2 = await _one_comment_attempt(
+        plugin, build_style_retry_prompt(prompt, text))
+    if reason2 == "stiff":
+        logger.warning(f"重写后仍是书面通稿腔，放弃发布: {text2[:40]}")
+        return "", "stiff_dropped"
+    if reason2 == "ok":
+        logger.info(f"重写后合格: {text2}")
+    return text2, reason2
+
+
 class ReplyManager:
     def __init__(self, plugin, store):
         """
@@ -329,21 +393,12 @@ class ReplyManager:
                             "留意评论时间与当前时间的间隔，别把几天前的评论当成刚发的。"
                         )
                     logger.info(f"正在回复 {comment.get('nickname')} 的评论: {comment.get('content', '')[:30]}")
-                    reply_message = sanitize_llm_output(await _llm_generate(self._plugin, prompt))
+                    # 生成+全部发布前检查（纪律/净化/拒答/身份/语域）一次过，
+                    # 与自动评论、被@回复共用同一套判定，避免三处判定漂移
+                    reply_message, reason = await generate_guarded_comment(self._plugin, prompt)
                     if not reply_message:
-                        # 空回复也标记已处理，避免下一轮对同一评论无限重试
-                        logger.warning("LLM 回复内容为空，标记已处理并跳过")
-                        await self._store.mark_processed(fid, comment["comment_tid"])
-                        continue
-                    if looks_like_refusal(reply_message):
-                        # 拒答文本绝不能发布（会变成 bot 公开教训好友）
-                        logger.warning(f"LLM 返回拒答内容，已跳过回复: {reply_message[:50]}")
-                        await self._store.mark_processed(fid, comment["comment_tid"])
-                        continue
-                    if looks_like_identity_confusion(reply_message):
-                        # 身份错位文本绝不能发布——评论者是好友不是主人，
-                        # 对好友称「主人」等于 bot 公开认错爹（2026-09-26 事故）
-                        logger.warning(f"LLM 称呼好友为主人（身份错位），已跳过回复: {reply_message[:50]}")
+                        # 空回复/被拦也标记已处理，避免下一轮对同一评论无限重试
+                        logger.warning(f"回复为空或被拦截（{reason}），标记已处理并跳过")
                         await self._store.mark_processed(fid, comment["comment_tid"])
                         continue
                     result = await api.reply(

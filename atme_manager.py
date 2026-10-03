@@ -19,9 +19,7 @@ import asyncio
 import datetime
 import random
 
-from .reply_manager import (_llm_generate, format_comment_time,
-                            looks_like_identity_confusion,
-                            looks_like_refusal, sanitize_llm_output)
+from .reply_manager import (format_comment_time, generate_guarded_comment)
 
 
 class NoLogger:
@@ -46,11 +44,13 @@ def set_atme_manager_logger(custom_logger):
     logger = custom_logger
 
 
+# 默认被@回复模板（仅作占位符骨架；发言纪律由 comment_style.STYLE_GUARD
+# 在代码层追加，本模板不重复写"口语化/不超过N字"之类规则，避免两处口径漂移）
 _DEFAULT_ATME_PROMPT = (
-    "你是{bot_name}，你在QQ空间被好友@了。"
+    "你是{bot_name}，好友在QQ空间@了你。"
     "说说内容：{post}；互动者：{nickname}；相关内容：{mention_content}；"
     "互动时间：{created_time}；当前时间：{current_time}。"
-    "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"
+    "写一句回复，只输出回复内容。"
     "留意互动时间与当前时间的间隔，别把几天前的@当成刚发的。"
 )
 
@@ -171,22 +171,17 @@ class AtmeManager:
         except (KeyError, IndexError):
             # 模板占位符不匹配时回退默认模板（也带时间上下文）
             prompt = (
-                f"你是{bot_name}，你在QQ空间被好友@了。"
+                f"你是{bot_name}，好友在QQ空间@了你。"
                 f"说说内容：{post_content}；互动者：{nickname}；相关内容：{mention_content}；"
                 f"互动时间：{created_time_str}；当前时间：{now_str}。"
-                "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"
+                "写一句回复，只输出回复内容。"
                 "留意互动时间与当前时间的间隔，别把几天前的@当成刚发的。"
             )
-        reply_message = sanitize_llm_output(await _llm_generate(self._plugin, prompt))
+        # 生成+发布前检查（发言纪律/净化/拒答/身份错位/语域）一次过，
+        # 与自动评论、回评共用同一套判定
+        reply_message, reason = await generate_guarded_comment(self._plugin, prompt)
         if not reply_message:
-            logger.warning("被@回复内容为空，跳过")
-            return False
-        if looks_like_refusal(reply_message):
-            logger.warning(f"LLM 返回拒答内容，已跳过被@回复: {reply_message[:50]}")
-            return False
-        if looks_like_identity_confusion(reply_message):
-            # @我的是好友不是主人，对好友称「主人」等于 bot 公开认错爹
-            logger.warning(f"LLM 称呼好友为主人（身份错位），已跳过被@回复: {reply_message[:50]}")
+            logger.warning(f"被@回复为空或被拦截（{reason}），跳过")
             return False
 
         if reply_target is not None:

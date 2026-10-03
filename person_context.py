@@ -158,4 +158,10 @@ async def fetch_person_context(plugin, user_id: str,
     else:
         result["state"] = _extract_value(raw_state)
 
+    # 只有"真的注入进去了"才打 INFO：v1.2.6 起画像注入一直只打 debug，
+    # 真机上从没被验证过是否生效（看不到任何痕迹）。这一行是真机自证信号。
+    if result["state"]:
+        logger.info(f"人物画像已注入: uid={uid} name={result['name']} "
+                    f"印象{len(result['state'].splitlines())}行")
+
     return result
