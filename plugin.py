@@ -138,10 +138,11 @@ class ReplyConfig(PluginConfigBase):
         default=("你是{bot_name}，你在QQ空间自己的说说下收到了评论。"
                  "说说内容：{content}；评论者：{nickname}；评论内容：{comment_content}；"
                  "评论时间：{created_time}；当前时间：{current_time}。"
-                 "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"
+                 "请直接输出回复内容，只输出回复内容本身。"
                  "留意评论时间与当前时间的间隔，别把几天前的评论当成刚发的。"),
         description="回复评论的LLM提示词模板（可用 {bot_name} {content} {nickname} "
-                    "{comment_content} {created_time} {current_time}）",
+                    "{comment_content} {created_time} {current_time}）。"
+                    "发言纪律由代码层强制追加，无需重复写",
     )
 
 
@@ -157,9 +158,13 @@ class AutoConfig(PluginConfigBase):
     action_interval_sec: int = Field(default=3, description="逐条处理动态的基础间隔秒数")
     comment_prompt: str = Field(
         default=("好友{target_name}发了说说：{content}。"
-                 "请以 bot 身份写一条自然的评论，口语化、不超过40字、只输出评论内容。"),
+                 "写一句你想在TA这条说说下留的评论，只输出评论内容。"
+                 "注意：{target_name}是你的好友，不是你的主人/创造者/调教者，"
+                 "即使TA的动态在谈论制作 bot 或 AI，也不要把TA当成自己的主人。"),
         description="自动评论好友动态的LLM提示词模板（可用 {target_name} {content}；"
-                    "画像非空时自动附加你对TA的了解）",
+                    "画像非空时自动附加你对TA的了解）。"
+                    "发言纪律（禁复述总结/口语短句/读不懂就说读不懂/禁书面套话）"
+                    "由代码层强制追加，无需也不建议写进本模板",
     )
     enable_person_context: bool = Field(default=True, description="评论时注入 MaiBot 人物画像（昵称+印象，只读）")
     person_name_field: str = Field(default="person_name", description="人物昵称属性名（Host Person 对象属性）")
@@ -170,13 +175,14 @@ class AutoConfig(PluginConfigBase):
     atme_poll_count: int = Field(default=10, description="每轮拉取「与我相关」条数（1~20）")
     atme_max_replies_per_run: int = Field(default=5, description="单轮被@回复上限")
     atme_prompt: str = Field(
-        default=("你是{bot_name}，你在QQ空间被好友@了。"
+        default=("你是{bot_name}，好友在QQ空间@了你。"
                  "说说内容：{post}；互动者：{nickname}；相关内容：{mention_content}；"
                  "互动时间：{created_time}；当前时间：{current_time}。"
-                 "请直接输出回复内容，口语化、不超过50字、不要引号和多余说明。"
+                 "写一句回复，只输出回复内容。"
                  "留意互动时间与当前时间的间隔，别把几天前的@当成刚发的。"),
         description="被@回复的LLM提示词模板（可用 {bot_name} {post} {nickname} "
-                    "{mention_content} {created_time} {current_time}）")
+                    "{mention_content} {created_time} {current_time}）。"
+                    "发言纪律由代码层强制追加，无需重复写")
 
 
 class QueueConfig(PluginConfigBase):

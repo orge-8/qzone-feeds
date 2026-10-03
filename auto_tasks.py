@@ -10,8 +10,7 @@ import datetime
 import random
 
 from .person_context import fetch_person_context
-from .reply_manager import (_llm_generate, looks_like_refusal,
-                            looks_like_identity_confusion, sanitize_llm_output)
+from .reply_manager import generate_guarded_comment
 
 
 class NoLogger:
@@ -81,9 +80,13 @@ def _is_in_silent_period(silent_hours_config: str) -> bool:
         return False
 
 
+# 默认评论模板（仅作占位符骨架）。
+# 注意：这里刻意**不写**「请以 bot 身份」——那句会让模型进入"我是机器人"的
+# 自我指涉状态，产出的正是官方通稿腔（2026-10-03 事故）。发言纪律统一由
+# comment_style.STYLE_GUARD 在代码层追加，本模板只提供素材。
 _DEFAULT_COMMENT_PROMPT = (
     "好友{target_name}发了说说：{content}。"
-    "请以 bot 身份写一条自然的评论，口语化、不超过40字、只输出评论内容。"
+    "写一句你想在TA这条说说下留的评论，只输出评论内容。"
     "注意：{target_name}是你的好友，不是你的主人/创造者/调教者，"
     "即使TA的动态在谈论制作 bot 或 AI，也不要把TA当成自己的主人。"
 )
@@ -179,16 +182,12 @@ async def process_feeds(
                 prompt = _build_comment_prompt(
                     comment_prompt_tpl, person_ctx["name"], content,
                     profile=person_ctx["state"])
-                comment_text = sanitize_llm_output(await _llm_generate(plugin, prompt))
-                if comment_text and looks_like_refusal(comment_text):
-                    # 拒答文本绝不能发布——会变成 bot 在好友空间里公开"教训"对方
-                    logger.warning(f"LLM 返回拒答内容，跳过评论 {fid}: {comment_text[:50]}")
-                    comment_text = ""
-                if comment_text and looks_like_identity_confusion(comment_text):
-                    # 身份错位文本绝不能发布——评论对象是好友不是主人，
-                    # 「认输吧主人」类评论等于 bot 公开认错爹（2026-09-26 事故）
-                    logger.warning(f"LLM 称呼好友为主人（身份错位），跳过评论 {fid}: {comment_text[:50]}")
-                    comment_text = ""
+                # 生成+发布前检查（发言纪律/净化/拒答/身份错位/语域）一次过。
+                # 纪律段在代码层追加（见 comment_style），不依赖用户可编辑模板——
+                # config.toml 首跑落盘后不随插件升级更新，写在模板里的规则等于没写。
+                comment_text, reason = await generate_guarded_comment(plugin, prompt)
+                if not comment_text:
+                    logger.info(f"评论跳过 {fid}（{reason}）")
                 if comment_text:
                     ok = await api.comment(fid, target_qq, comment_text)
                     if ok:

@@ -71,6 +71,8 @@ atme_manager = importlib.import_module("qzf.atme_manager")
 auto_tasks = importlib.import_module("qzf.auto_tasks")
 vision = importlib.import_module("qzf.vision")
 image_compress = importlib.import_module("qzf.image_compress")
+comment_style = importlib.import_module("qzf.comment_style")
+person_context = importlib.import_module("qzf.person_context")
 
 
 # ============================================================
@@ -565,12 +567,12 @@ async def test_comment_material_guard():
     """回归：无可评论素材（转发抓不到内容 / 纯占位图）时不得评论，点赞不受影响。"""
     section("G. 评论素材守卫")
     at = auto_tasks
-    orig_llm = at._llm_generate
+    orig_llm = reply_manager._llm_generate
 
     async def fake_llm(plugin, prompt):
         return "模拟评论"
 
-    at._llm_generate = fake_llm
+    reply_manager._llm_generate = fake_llm
     try:
         base = {"target_qq": "20001", "videos": [], "comments": []}
 
@@ -605,12 +607,12 @@ async def test_comment_material_guard():
             captured["p"] = prompt
             return "x"
 
-        at._llm_generate = cap_llm
+        reply_manager._llm_generate = cap_llm
         await run({**base, "tid": "e6", "content": "有内容的动态", "rt_con": "", "images": []})
         check("G07 有素材时 prompt 内容位非空",
               "说说：有内容的动态" in captured.get("p", ""), captured.get("p", "")[:60])
     finally:
-        at._llm_generate = orig_llm
+        reply_manager._llm_generate = orig_llm
 
 
 # ============================================================
@@ -638,7 +640,7 @@ async def test_person_context():
         def __init__(self, cap):
             self.ctx = types.SimpleNamespace(person=cap)
 
-    orig_llm = at._llm_generate
+    orig_llm = reply_manager._llm_generate
 
     async def run_with(plugin, feed):
         captured = {}
@@ -647,7 +649,7 @@ async def test_person_context():
             captured["p"] = prompt
             return "模拟评论"
 
-        at._llm_generate = cap_llm
+        reply_manager._llm_generate = cap_llm
         store, api = _FakeStore(), _FakeApi()
         await at.process_feeds(plugin, api, store, [feed],
                                like_probability=0, comment_probability=1.0,
@@ -725,7 +727,7 @@ async def test_person_context():
             captured9["p"] = prompt
             return "模拟评论"
 
-        at._llm_generate = cap_llm9
+        reply_manager._llm_generate = cap_llm9
         store9, api9 = _FakeStore(), _FakeApi()
         await at.process_feeds(plugin9, api9, store9, [base_feed],
                                like_probability=0, comment_probability=1.0,
@@ -743,7 +745,7 @@ async def test_person_context():
             captured10["p"] = prompt
             return "模拟评论"
 
-        at._llm_generate = cap_llm10
+        reply_manager._llm_generate = cap_llm10
         store10, api10 = _FakeStore(), _FakeApi()
         await at.process_feeds(plugin10, api10, store10, [base_feed],
                                like_probability=0, comment_probability=1.0,
@@ -793,7 +795,7 @@ async def test_person_context():
         check("N14c _extract_value list→空", pc_inst._extract_value(["a"]) == "")
         check("N14d _extract_value 'None'字符串→空", pc_inst._extract_value("None") == "")
     finally:
-        at._llm_generate = orig_llm
+        reply_manager._llm_generate = orig_llm
 
 
 # ============================================================
@@ -1088,14 +1090,14 @@ async def test_failure_markers_excluded():
     """J06~J09：图片加载失败标记不得进入评论 prompt。"""
     section("J. 失败标记不进 prompt")
     at = auto_tasks
-    orig = at._llm_generate
+    orig = reply_manager._llm_generate
     captured = {}
 
     async def cap_llm(plugin, prompt):
         captured["p"] = prompt
         return "模拟评论"
 
-    at._llm_generate = cap_llm
+    reply_manager._llm_generate = cap_llm
     try:
         base = {"target_qq": "20001", "videos": [], "comments": []}
 
@@ -1126,7 +1128,7 @@ async def test_failure_markers_excluded():
               "[图: 九位角色立绘合影]" in captured.get("p", "") and len(api.comments) == 1,
               f"prompt={captured.get('p', '')[:70]!r}")
     finally:
-        at._llm_generate = orig
+        reply_manager._llm_generate = orig
 
 
 # ============================================================
@@ -1390,12 +1392,12 @@ async def test_identity_confusion_not_published():
     """M2.4~M2.6：身份错位文本不得产生评论/回复副作用（与拒答同路径拦截）。"""
     section("M2. 身份错位不发布")
     at = auto_tasks
-    orig = at._llm_generate
+    orig = reply_manager._llm_generate
 
     async def identity_llm(plugin, prompt):
         return _IDENTITY_SAMPLES[0]
 
-    at._llm_generate = identity_llm
+    reply_manager._llm_generate = identity_llm
     try:
         base = {"target_qq": "20001", "videos": [], "comments": []}
         store, api = _FakeStore(), _FakeApi()
@@ -1408,19 +1410,19 @@ async def test_identity_confusion_not_published():
               f"却发了：{api.comments[:1]}" if api.comments else "已拦截")
         check("M2.5 身份错位时点赞仍执行", api.likes == ["i1"], f"likes={api.likes}")
     finally:
-        at._llm_generate = orig
+        reply_manager._llm_generate = orig
 
 
 async def test_refusal_not_published():
     """M05~M07：拒答文本不得产生评论/回复副作用。"""
     section("M. 拒答不发布")
     at = auto_tasks
-    orig = at._llm_generate
+    orig = reply_manager._llm_generate
 
     async def refusal_llm(plugin, prompt):
         return _REFUSAL_SAMPLE
 
-    at._llm_generate = refusal_llm
+    reply_manager._llm_generate = refusal_llm
     try:
         base = {"target_qq": "20001", "videos": [], "comments": []}
         store, api = _FakeStore(), _FakeApi()
@@ -1433,7 +1435,7 @@ async def test_refusal_not_published():
               f"却发了：{api.comments[:1]}" if api.comments else "已拦截")
         check("M06 拒答时点赞仍执行", api.likes == ["r1"], f"likes={api.likes}")
     finally:
-        at._llm_generate = orig
+        reply_manager._llm_generate = orig
 
     # M07 回评路径同样拦截
     orig2 = reply_manager._llm_generate
@@ -1591,6 +1593,218 @@ async def test_reply_prompt_time_context():
               f"prompt={p3[:240]!r}")
     finally:
         reply_manager._llm_generate = orig
+
+
+# ============================================================
+# R. 发言纪律与语域拦截（真机事故 2026-10-03）
+# ============================================================
+# 真机原文：好友动态「喜报，无料有了，我奶找到了」→ bot 评论
+# 「恭喜！双喜临门，无料和奶奶都到位啦！」被围观嘲笑。
+# 两类问题：① 语域错位（官方通稿腔）② 硬解梗（读不懂却脑补）。
+# 用户定的方向：读不懂就别装懂、宁可短。
+_STIFF_SAMPLE = "恭喜！双喜临门，无料和奶奶都到位啦！"
+
+
+def test_style_guard():
+    section("R. 发言纪律（代码级追加）")
+    cs = comment_style
+
+    p = cs.append_style_guard("好友A发了说说：今天天气不错。")
+    check("R01 纪律段已追加且原 prompt 保留",
+          "【发言纪律" in p and p.startswith("好友A发了说说"), p[:40])
+    check("R02 纪律段幂等（重复追加只有一段）",
+          cs.append_style_guard(p).count("【发言纪律") == 1)
+    # 四要素缺一不可：禁复述总结 / 短 / 读不懂就直说 / 成语祝语官方腔 + 弃评出口
+    check("R03 纪律段含全部要素",
+          all(k in p for k in ("不要复述", "宁可短", "读不懂", "成语", "[跳过]")))
+    check("R04 空 prompt 也带纪律段", "【发言纪律" in cs.append_style_guard(""))
+
+    rp = cs.build_style_retry_prompt("原始要求", _STIFF_SAMPLE)
+    check("R05 重写 prompt 含反例原文 + 纪律段 + 重写要求",
+          "双喜临门" in rp and "【发言纪律" in rp and "重写" in rp and "[跳过]" in rp)
+
+
+def test_skip_sentinel():
+    section("R. 主动弃评出口")
+    cs = comment_style
+
+    for s in ("[跳过]", "[不评论]", "[略过]"):
+        check(f"R06 弃评标记命中 {s}", cs.looks_like_skip(s) is True)
+    check("R07 标记后带解释也算弃评",
+          cs.looks_like_skip("[跳过]，这个我真看不懂") is True)
+
+    ok_samples = ["没看懂", "啥意思？", "哈哈", "牛的", "跳过这个话题吧"]
+    bad = [s for s in ok_samples if cs.looks_like_skip(s)]
+    check("R08 正常回复不误判为弃评", not bad, f"误判：{bad}" if bad else "正常")
+    check("R09 空文本不误判",
+          cs.looks_like_skip("") is False and cs.looks_like_skip(None) is False)
+
+
+def test_stiff_register_detection():
+    section("R. 书面套话拦截")
+    cs = comment_style
+
+    stiff_samples = [
+        _STIFF_SAMPLE,               # 09-03 真机原文
+        "祝您事事顺利",
+        "愿你前程似锦",
+        "总结一下：这次真的很棒",
+        "感谢您的分享",
+        "建议您下次早点睡",
+    ]
+    for i, s in enumerate(stiff_samples, 1):
+        check(f"R10.{i} 通稿腔命中: {s[:16]}", cs.looks_like_stiff_register(s) is True)
+
+    # 口语高频词（到位/收到/完美/绝了）刻意**不收**入特征表，避免误拦正常回复
+    ok_samples = [
+        "牛的",
+        "这操作到位啊",
+        "哈哈笑死",
+        "没看懂",
+        "图不错，出处呢",
+        "收到，回头看看",
+        "厉害了",
+        "我也想去",
+    ]
+    bad = [s for s in ok_samples if cs.looks_like_stiff_register(s)]
+    check("R11 正常口语回复不误判", not bad, f"误判：{bad}" if bad else "全部正常")
+    check("R12 空文本不误判",
+          cs.looks_like_stiff_register("") is False
+          and cs.looks_like_stiff_register(None) is False)
+
+
+async def test_style_guard_not_published():
+    """R13~R19：语域不合格时的行为（重写→合格发布 / 重写→仍不合格放弃）。"""
+    section("R. 语域重写与放弃发布")
+    orig = reply_manager._llm_generate
+    feed = {"tid": "s1", "target_qq": "20001", "content": "喜报，无料有了，我奶找到了",
+            "rt_con": "", "images": [], "videos": [], "comments": []}
+
+    async def _run(f):
+        store, api = _FakeStore(), _FakeApi()
+        await auto_tasks.process_feeds(None, api, store, [f],
+                                       like_probability=1.0, comment_probability=1.0,
+                                       action_interval=0)
+        return api
+
+    # R13/R14/R18/R19：首次通稿腔 → 重写后合格 → 发布重写结果
+    calls, captured = {"n": 0}, {}
+
+    async def llm_retry_ok(plugin, prompt):
+        calls["n"] += 1
+        captured[f"p{calls['n']}"] = prompt
+        return _STIFF_SAMPLE if calls["n"] == 1 else "没看懂"
+
+    reply_manager._llm_generate = llm_retry_ok
+    try:
+        api = await _run(feed)
+        check("R13 通稿腔重写后合格 → 发布重写结果", api.comments == ["没看懂"],
+              f"comments={api.comments}")
+        check("R14 确实重写了一次（共 2 次 LLM 调用）", calls["n"] == 2, f"n={calls['n']}")
+        check("R19 首次 prompt 含纪律段", "【发言纪律" in captured.get("p1", ""))
+        check("R18 重写 prompt 含不合格原文与纪律段",
+              "双喜临门" in captured.get("p2", "")
+              and "【发言纪律" in captured.get("p2", ""), captured.get("p2", "")[:120])
+    finally:
+        reply_manager._llm_generate = orig
+
+    # R15/R16：两次都通稿腔 → 放弃发布（宁可少一条评论，不发通稿腔）
+    calls2 = {"n": 0}
+
+    async def llm_always_stiff(plugin, prompt):
+        calls2["n"] += 1
+        return _STIFF_SAMPLE
+
+    reply_manager._llm_generate = llm_always_stiff
+    try:
+        api = await _run({**feed, "tid": "s2"})
+        check("R15 重写后仍通稿腔 → 放弃发布", not api.comments,
+              f"却发了：{api.comments[:1]}" if api.comments else "已放弃")
+        check("R16 放弃发布时点赞仍执行", api.likes == ["s2"], f"likes={api.likes}")
+        check("R17 重写有上限（只尝试 2 次，不无限重写）", calls2["n"] == 2, f"n={calls2['n']}")
+    finally:
+        reply_manager._llm_generate = orig
+
+    # R20：模型主动弃评 → 不发布
+    async def llm_skip(plugin, prompt):
+        return "[跳过]"
+
+    reply_manager._llm_generate = llm_skip
+    try:
+        api = await _run({**feed, "tid": "s3"})
+        check("R20 模型主动弃评 → 不发布", not api.comments,
+              f"却发了：{api.comments[:1]}" if api.comments else "已弃评")
+    finally:
+        reply_manager._llm_generate = orig
+
+    # R21：回评路径同样受语域拦截（三条路径共用判定，不能只在自动评论上修）
+    async def llm_stiff2(plugin, prompt):
+        return _STIFF_SAMPLE
+
+    reply_manager._llm_generate = llm_stiff2
+    try:
+        class _ClsStore:
+            async def is_processed(self, fid, tid=None):
+                return False
+
+            async def mark_processed(self, fid, tid=None):
+                return True
+
+        class _ReplyApi:
+            uin = "10001"
+            qq_nickname = ""
+
+            def __init__(self):
+                self.replies = []
+
+            async def get_list(self, *a, **kw):
+                return [{"tid": "rf1", "target_qq": "10001", "content": "我的说说",
+                         "images": [], "comments": [
+                             {"qq_account": "20001", "nickname": "友", "content": "好图",
+                              "comment_tid": 222, "created_time": ""}]}]
+
+            async def reply(self, *a, **kw):
+                self.replies.append(a)
+                return True
+
+        class _P:
+            class config:
+                class reply:
+                    scan_count = 5
+                    max_replies_per_run = 10
+                    reply_interval_sec = 0
+                    prompt = "你是{bot_name}。说说：{content}；评论者：{nickname}；评论：{comment_content}"
+
+        rapi = _ReplyApi()
+        await reply_manager.ReplyManager(_P(), _ClsStore()).reply_new_comments(rapi)
+        check("R21 回评路径同样拦通稿腔", not rapi.replies,
+              f"却回复了：{rapi.replies[:1]}" if rapi.replies else "已拦截")
+    finally:
+        reply_manager._llm_generate = orig
+
+
+def test_style_wiring_lock():
+    """R22~R24：结构回归锁——纪律必须走代码层，且三条路径共用同一判定。"""
+    section("R. 结构回归锁")
+
+    hits = []
+    for name in ("auto_tasks.py", "atme_manager.py", "plugin.py"):
+        txt = (Path(PLUGIN_DIR) / name).read_text(encoding="utf-8")
+        for line in txt.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            if "以 bot 身份" in line or "以bot身份" in line:
+                hits.append(f"{name}: {line.strip()[:60]}")
+    check("R22 默认模板/配置不再要求「以 bot 身份」", not hits, str(hits))
+
+    check("R23 三条生成路径统一走 generate_guarded_comment",
+          all("generate_guarded_comment" in
+              (Path(PLUGIN_DIR) / f).read_text(encoding="utf-8")
+              for f in ("auto_tasks.py", "reply_manager.py", "atme_manager.py")))
+
+    pc_src = (Path(PLUGIN_DIR) / "person_context.py").read_text(encoding="utf-8")
+    check("R24 画像注入成功有 INFO 自证日志",
+          "人物画像已注入" in pc_src and "logger.info" in pc_src)
 
 
 def test_manifest():
@@ -1852,12 +2066,12 @@ async def test_atme_detection():
 
     plugin = _AutoPlugin(auto_kw={"enable_atme_reply": True, "reply_interval_sec": 0})
     mgr = am.AtmeManager(plugin, _AtmeStore())
-    orig_llm = am._llm_generate
+    orig_llm = reply_manager._llm_generate
 
     async def ok_llm(p, prompt):
         return "哈哈你好呀"
 
-    am._llm_generate = ok_llm
+    reply_manager._llm_generate = ok_llm
     try:
         api3 = _AtmeApi(atme_items, feed_t2)
         ok, msg = await mgr.reply_atme_mentions(api3)
@@ -1878,7 +2092,7 @@ async def test_atme_detection():
         async def refusal_llm(p, prompt):
             return "抱歉，我不能按照你的要求进行创作"
 
-        am._llm_generate = refusal_llm
+        reply_manager._llm_generate = refusal_llm
         mgr2 = am.AtmeManager(plugin, _AtmeStore())
         api5 = _AtmeApi([atme_items[0]], None)
         await mgr2.reply_atme_mentions(api5)
@@ -1888,16 +2102,16 @@ async def test_atme_detection():
         async def identity_llm(p, prompt):
             return "嘿嘿，认输吧主人[得意]"
 
-        am._llm_generate = identity_llm
+        reply_manager._llm_generate = identity_llm
         mgr3 = am.AtmeManager(plugin, _AtmeStore())
         api6 = _AtmeApi([atme_items[0]], None)
         await mgr3.reply_atme_mentions(api6)
         check("P13 身份错位不发布被@回复", not api6.comments and not api6.replies)
     finally:
-        am._llm_generate = orig_llm
+        reply_manager._llm_generate = orig_llm
 
     # ── comment_mention 定位失败降级为评论说说 ──
-    am._llm_generate = ok_llm
+    reply_manager._llm_generate = ok_llm
     try:
         plugin4 = _AutoPlugin(auto_kw={"enable_atme_reply": True, "reply_interval_sec": 0})
         mgr4 = am.AtmeManager(plugin4, _AtmeStore())
@@ -1909,7 +2123,7 @@ async def test_atme_detection():
               len(api7.comments) == 1 and not api7.replies,
               f"comments={api7.comments} replies={api7.replies}")
     finally:
-        am._llm_generate = orig_llm
+        reply_manager._llm_generate = orig_llm
 
     # ── P15~P17 被@回复的时间上下文（v1.3.2） ──
     captured = {}
@@ -1918,7 +2132,7 @@ async def test_atme_detection():
         captured["prompt"] = prompt
         return "收到啦"
 
-    am._llm_generate = capture_llm
+    reply_manager._llm_generate = capture_llm
     try:
         ts = 1790404744
         ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
@@ -1946,7 +2160,7 @@ async def test_atme_detection():
               p2.startswith("你是MaiBot") and ts_str in p2 and "当前时间" in p2,
               f"prompt={p2[:220]!r}")
     finally:
-        am._llm_generate = orig_llm
+        reply_manager._llm_generate = orig_llm
 
 
 # ============================================================
@@ -1991,6 +2205,11 @@ async def _amain():
     await test_atme_detection()
     test_format_comment_time()
     await test_reply_prompt_time_context()
+    test_style_guard()
+    test_skip_sentinel()
+    test_stiff_register_detection()
+    await test_style_guard_not_published()
+    test_style_wiring_lock()
     test_manifest()
 
 
