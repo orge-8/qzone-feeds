@@ -21,6 +21,7 @@ from .auto_tasks import AutoTaskLoop, _is_in_silent_period, process_feeds, run_a
 from .atme_manager import AtmeManager, set_atme_manager_logger
 from .cookie_manager import CookieManager
 from .person_context import set_person_context_logger
+from .host_persona import set_host_persona_logger, reset_persona_cache
 from .processed_store import ProcessedStore
 from .qzone_api import (
     CookieExpiredError,
@@ -142,7 +143,7 @@ class ReplyConfig(PluginConfigBase):
                  "留意评论时间与当前时间的间隔，别把几天前的评论当成刚发的。"),
         description="回复评论的LLM提示词模板（可用 {bot_name} {content} {nickname} "
                     "{comment_content} {created_time} {current_time}）。"
-                    "发言纪律由代码层强制追加，无需重复写",
+                    "发言纪律与宿主人设由代码层注入，无需重复写",
     )
 
 
@@ -152,9 +153,19 @@ class AutoConfig(PluginConfigBase):
     enable_auto_read: bool = Field(default=False, description="定时自动读好友动态并点赞/评论")
     enable_auto_reply: bool = Field(default=False, description="自动回复自己动态的新评论")
     interval_min: int = Field(default=30, description="自动任务循环间隔（分钟）")
+    interval_jitter_min: int = Field(
+        default=5,
+        description="循环间隔随机抖动幅度（分钟），每轮在 interval±jitter 内随机触发，"
+                    "降低固定节奏的风控指纹；代码级钳制不超过 interval 的一半，填 0 关闭抖动")
     silent_hours: str = Field(default="23:00-07:30", description="静默时段 HH:MM-HH:MM，逗号分隔多段，支持跨零点")
     like_probability: float = Field(default=0.9, description="自动读每条动态后点赞的概率 0~1")
     comment_probability: float = Field(default=0.6, description="自动读每条动态后评论的概率 0~1")
+    short_content_chars: int = Field(
+        default=15,
+        description=("正文短于此字数、**含 @ 提及**、且该说说有图未能识别时，只点赞不评论（v1.6.0）。"
+                     "此时那句话是在对某个具体的人说，而承载关系语境的那张图没读到，照评易踩雷；"
+                     "不含 @ 或图正常的说说不受影响。设为 0 关闭本规则"),
+    )
     action_interval_sec: int = Field(default=3, description="逐条处理动态的基础间隔秒数")
     comment_prompt: str = Field(
         default=("好友{target_name}发了说说：{content}。"
@@ -164,11 +175,36 @@ class AutoConfig(PluginConfigBase):
         description="自动评论好友动态的LLM提示词模板（可用 {target_name} {content}；"
                     "画像非空时自动附加你对TA的了解）。"
                     "发言纪律（禁复述总结/口语短句/读不懂就说读不懂/禁书面套话）"
-                    "由代码层强制追加，无需也不建议写进本模板",
+                    "与宿主人设均由代码层注入，无需也不建议写进本模板",
     )
     enable_person_context: bool = Field(default=True, description="评论时注入 MaiBot 人物画像（昵称+印象，只读）")
     person_name_field: str = Field(default="person_name", description="人物昵称属性名（Host Person 对象属性）")
     person_state_field: str = Field(default="memory_points", description="人物印象属性名（memory_points 列表自动提取内容段）")
+    # ── v1.7.0 评论决策策略 ────────────────────────────────────────────────
+    # 边界 B：配置里只放「开关 + 阈值」。规则内容、判定顺序、reason 枚举、
+    # 三类 fail-closed 硬兜底（拒答/身份错位/亲昵语域）与 20 字上限全部
+    # 由 comment_policy.py 在代码层写死 —— config.toml 首跑落盘后不随插件
+    # 升级更新，写在配置默认值里的规则对已部署实例等于没写（v1.2.9 等三次踩坑）。
+    comment_policy_enabled: bool = Field(
+        default=True,
+        description="评论决策增强总开关：正向 few-shot、下笔前理解校验、打卡类动态分流。"
+                    "关闭仅影响这三项新增引导；拒答/身份错位/亲昵语域三类拦截恒生效")
+    max_comment_chars: int = Field(
+        default=20,
+        description="发布评论的最大字数（代码级硬上限 20，填更大值也只认 20；最小 1）。"
+                    "只钳制最终发布文本，不影响净化步骤")
+    stiff_retry_enabled: bool = Field(
+        default=True,
+        description="命中书面通稿腔时是否给 LLM 一次重写机会；关闭则直接弃评（拦截不放宽）")
+    rule_hit_counter_enabled: bool = Field(
+        default=False,
+        description="仅观测：统计各类发布前规则的命中次数，不参与任何判定")
+    # ── v1.8.0 性能与流程优化 ─────────────────────────────────────────────
+    lazy_vision_enabled: bool = Field(
+        default=True,
+        description="自动任务延迟识图：先做去重/概率判定，确定要评论才下载图片并调 VLM，"
+                    "省掉已处理/黑名单/概率弃评条目的识别开销；仅影响自动任务，"
+                    "命令路径不变；关闭则恢复拉取时即识图的旧行为")
     enable_atme_reply: bool = Field(
         default=False,
         description="被@检测与回复（「与我相关」接口：正文@→评论说说，评论@→回评该评论）")
@@ -182,12 +218,40 @@ class AutoConfig(PluginConfigBase):
                  "留意互动时间与当前时间的间隔，别把几天前的@当成刚发的。"),
         description="被@回复的LLM提示词模板（可用 {bot_name} {post} {nickname} "
                     "{mention_content} {created_time} {current_time}）。"
-                    "发言纪律由代码层强制追加，无需重复写")
+                    "发言纪律与宿主人设由代码层注入，无需重复写")
+
+
+class PersonaConfig(PluginConfigBase):
+    __ui_label__ = "宿主人设"
+    __ui_order__ = 7
+    enable_host_persona: bool = Field(
+        default=True,
+        description=("评论/回评/被@回复时注入宿主人设与表达风格（读 config.toml 的 "
+                     "[personality] personality + reply_style，只读）。"
+                     "两段只影响语气，与发言纪律冲突时以纪律为准"))
+    persona_prompt: str = Field(
+        default="",
+        description=("人设覆盖项（可选）。留空 = 自动读宿主 personality；"
+                     "填写则整体接管——人设与表达风格都不再读宿主"))
+    reply_style_prompt: str = Field(
+        default="",
+        description=("表达风格覆盖项（可选）。留空 = 自动读宿主 reply_style；"
+                     "填写则只替换表达风格，人设仍读宿主（persona_prompt 非空时本项不生效）"))
+    persona_max_chars: int = Field(
+        default=600,
+        description="人设注入的最大字符数（按句截断）。人设是语气锚不是知识库，过长会稀释发言纪律")
+    reply_style_max_chars: int = Field(
+        default=100,
+        description=("表达风格注入的最大字符数（按句截断）。v1.6.0 起默认 100 且**硬上限 100**："
+                     "评论是公开短句，风格段过长会稀释发言纪律（真机实测 300 字 ≈ 一条 20 字评论的 15 倍）"))
+    persona_cache_ttl_sec: int = Field(
+        default=600,
+        description="宿主人设/风格读取结果的缓存秒数（避免每条评论都走一次 Host RPC）；0 表示每次重读")
 
 
 class QueueConfig(PluginConfigBase):
     __ui_label__ = "队列"
-    __ui_order__ = 7
+    __ui_order__ = 8
     retry_on_auth_fail: int = Field(default=1, description="cookie 失效自动重登重试次数")
     queue_timeout_sec: int = Field(default=120, description="命令侧等待队列结果的超时秒数（自动任务不受限）")
 
@@ -200,6 +264,7 @@ class QzoneFeedsConfig(PluginConfigBase):
     publish: PublishConfig = Field(default_factory=PublishConfig)
     reply: ReplyConfig = Field(default_factory=ReplyConfig)
     auto: AutoConfig = Field(default_factory=AutoConfig)
+    persona: PersonaConfig = Field(default_factory=PersonaConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
 
 
@@ -291,7 +356,12 @@ def format_feed(feed: dict, index: int | None = None) -> str:
     lines.append(title)
     body = feed.get("content", "")
     if feed.get("rt_con"):
-        body += f"\n↪ 转发: {feed['rt_con']}"
+        # v1.6.1：转发连同原作者一起显示，否则「老大」「老师」这类称呼看不出在对谁说
+        rt_author = str(feed.get("rt_author", "") or "").strip()
+        if rt_author:
+            body += f"\n↪ 转发 {rt_author}: {feed['rt_con']}"
+        else:
+            body += f"\n↪ 转发: {feed['rt_con']}"
     if body:
         lines.append(body)
     images = feed.get("images") or []
@@ -373,6 +443,9 @@ class QzoneFeedsPlugin(MaiBotPlugin):
         _ps.set_processed_store_logger(logger)
         _rm.set_reply_manager_logger(logger)
         set_person_context_logger(logger)
+        set_host_persona_logger(logger)
+        # 重载即丢弃人设缓存：改完 config.toml 后不必等 TTL 过期
+        reset_persona_cache()
 
         data_dir = self._resolve_data_dir()
         self._cookie_mgr = CookieManager(self, data_dir)
@@ -746,6 +819,7 @@ class QzoneFeedsPlugin(MaiBotPlugin):
                 person_context_enabled=bool(getattr(auto_cfg, "enable_person_context", True)),
                 person_name_field=str(getattr(auto_cfg, "person_name_field", "person_name") or "person_name"),
                 person_state_field=str(getattr(auto_cfg, "person_state_field", "memory_points") or "memory_points"),
+                short_content_chars=int(getattr(auto_cfg, "short_content_chars", 15) or 15),
             )
             blocks.append(
                 f"已点赞 {stats['liked']} 条 / 评论 {stats['commented']} 条"

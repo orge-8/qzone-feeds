@@ -9,6 +9,7 @@ import asyncio
 import datetime
 import random
 
+from . import comment_policy as _cp
 from .person_context import fetch_person_context
 from .reply_manager import generate_guarded_comment
 
@@ -95,6 +96,21 @@ _DEFAULT_COMMENT_PROMPT = (
 _PROFILE_HINT = ("你对TA的了解：{target_profile}。评论要符合你对TA的了解，"
                  "但不要复述画像内容。")
 
+# ── 转发内容的截断自证（v1.6.1）────────────────────────────────────────────
+# Qzone 列表页对长文只给前半段，尾部留省略号，原页另有「查看全文」。这里**不假设**
+# 接口一定截断，而是看数据本身：尾部是省略号才追加披露。命中才加，不命中一个字不加——
+# 宁可少说，不要给模型塞一句它用不上的元信息（v1.6.0 缺图披露的同一哲学）。
+_RT_TRUNCATION_TAILS = ("...", "…", "。。")
+
+
+def _rt_looks_truncated(text: str) -> bool:
+    """转发正文是否带截断标记（尾部省略号）。
+
+    v1.7.0：实现收拢到 `comment_policy.rt_looks_truncated`，这里保留公开名字，
+    供既有行为测试（S16）与调用方继续使用 —— 重构不换 API。
+    """
+    return _cp.rt_looks_truncated(text)
+
 
 def _build_comment_prompt(tpl: str, target_name: str, content: str,
                           profile: str = "") -> str:
@@ -103,6 +119,23 @@ def _build_comment_prompt(tpl: str, target_name: str, content: str,
     if profile:
         prompt += _PROFILE_HINT.format(target_profile=profile)
     return prompt
+
+
+def _bot_already_commented(feed: dict, my_uin) -> bool:
+    """P3 双保险判重：该说说的在线评论里是否已有 bot 自己的评论。
+
+    processed_list 是 LRU（200 feeds），裁剪后老说说有重评风险；在线评论
+    是服务端事实，零额外请求（两条拉取路径都已解析 comments）。
+    只认 QQ 号精确匹配，不认昵称（昵称可改可重名）。
+    my_uin 取不到时返回 False（退回 store 单保险，不误拦）。
+    """
+    uin = str(my_uin or "").strip()
+    if not uin:
+        return False
+    for comment in (feed.get("comments") or []):
+        if str(comment.get("qq_account", "") or "").strip() == uin:
+            return True
+    return False
 
 
 async def process_feeds(
@@ -118,18 +151,36 @@ async def process_feeds(
     person_context_enabled: bool = True,
     person_name_field: str = "person_name",
     person_state_field: str = "memory_points",
+    short_content_chars: int = 15,
+    policy: "_cp.Policy | None" = None,
+    lazy_vision: bool = False,
+    vision_params: tuple | None = None,
 ) -> dict:
     """一批说说的点赞+评论核心流程。
 
-    /说说 命令（概率 1.0，显式指令即显式意图）与自动任务（配置概率）共用。
+    /说说互动 命令（概率 1.0，显式指令即显式意图）与自动任务（配置概率）共用。
     去重走 store，逐条间隔 action_interval + 随机，处理完无论成败立即标记。
+    v1.7.0：素材决策（6 个点）交给 `comment_policy.decide_material()`；policy
+    未传入时自行从 plugin 配置解析（测试里 `process_feeds(None, ...)` 会安全退回默认）。
+
+    v1.8.0：
+    - P3 双保险判重恒生效：在线评论已含 bot 自己的评论 → 标记并跳过（防 LRU 裁剪重评）。
+    - P1 延迟识图（lazy_vision=True，仅自动任务）：feed 带 image_urls 且 images
+      为空时，先掷评论概率骰，通过才下载+VLM，再走原样 decide_material。
+      命令路径不传 lazy_vision，行为与旧版完全一致。
+      vision_params=(max_images, concurrency, compress, max_edge, quality)，
+      未传时回退 (9, 3, True, 1024, 80)。
 
     Returns:
         {"handled": 实际处理条数, "liked": 点赞数, "commented": 评论数}
     """
+    policy = policy or _cp.resolve_policy(plugin)
     blacklist = blacklist or set()
     if not comment_prompt_tpl:
         comment_prompt_tpl = _DEFAULT_COMMENT_PROMPT
+    if vision_params is None:
+        vision_params = (9, 3, True, 1024, 80)
+    my_uin = getattr(api, "uin", None)
     stats = {"handled": 0, "liked": 0, "commented": 0}
     for feed in feeds_list:
         target_qq = str(feed.get("target_qq", ""))
@@ -142,35 +193,52 @@ async def process_feeds(
         if await store.is_processed(fid):
             await store.mark_processed(fid)  # touch 保持 LRU 活跃
             continue
+        # P3 双保险：在线评论已有自己 → 视为已处理（store 可能已裁剪掉该记录）
+        if _bot_already_commented(feed, my_uin):
+            logger.info(f"跳过 {fid}：评论区已有 bot 自己的评论（双保险判重）")
+            await store.mark_processed(fid)
+            continue
         stats["handled"] += 1
         await asyncio.sleep(action_interval + random.random())
 
-        # 可评论素材判定：正文/转发内容，或"非占位符"的图片描述。
-        # 占位符（[图片] / [图片（识别失败）] / [图片（加载失败）]）既不构成素材，
-        # 也**不进 prompt**——真机实测把它写进内容后，LLM 会公开评论
-        # 「图裂了求补图」，等于把自身的取图故障当成对作者的吐槽。
-        # 无素材必须跳过评论：空白输入会让 LLM 凭空发挥（真机实测：
-        # 转发动态抓不到原内容 → prompt 变成「好友X发了说说：。」→
-        # 产出「哈哈转发了个寂寞，原内容是啥呀」这类无意义评论）。
-        text_material = (str(feed.get("content", "") or "").strip()
-                         or str(feed.get("rt_con", "") or "").strip())
-        image_material = [d for d in (feed.get("images") or [])
-                          if d and not str(d).lstrip().startswith("[图片")]
-        has_material = bool(text_material or image_material)
+        # ── P1 延迟识图：先掷评论概率骰，通过才识图 ─────────────────────
+        # 评论与点赞是两次独立掷骰，前置不影响各自分布（等价性见 CHANGELOG）。
+        # 识图后仍走原样 decide_material：C4「先识图再判」，带图打卡语义不变。
+        comment_roll_ok = random.random() <= comment_probability
+        if (lazy_vision and comment_roll_ok
+                and feed.get("image_urls") and not feed.get("images")):
+            max_img, conc, comp, edge, q = vision_params
+            try:
+                feed["images"] = await api._describe_images(
+                    list(feed["image_urls"]), max_img, conc,
+                    compress=comp, max_edge=edge, quality=q)
+            except Exception as e:
+                # 识图失败不阻断点赞；images 留空 → decide_material 按缺图口径走
+                logger.error(f"延迟识图失败 {fid}: {e}")
+
+        # v1.7.0：6 个素材决策点收拢到 `comment_policy.decide_material()`（纯函数）。
+        #   ① 素材守卫（正文/转发/非占位符图描述）  ② 只拼真实素材（占位符剔除）
+        #   ③ 转发归属降级 + 截断披露              ④ 缺图披露
+        #   ⑤ 短正文 + @ + 缺图 → 只点赞不评论      ⑥ 评论概率仍由下方 random 判
+        # 行为与 v1.6.1 逐条等价；新增 C4「打卡/签到类短动态只点赞不评论」，
+        # 受总开关控制、口径保守（见规则层 classify_feed），不影响话题类短说说。
+        decision = _cp.decide_material(
+            feed, short_content_chars=short_content_chars, policy=policy)
+        content = decision.content
+        has_material = decision.has_material
+        dropped = decision.dropped_images
         if not has_material:
             logger.info(f"跳过评论 {fid}：无可评论素材（正文/转发/图片描述均为空）")
-
-        # 只把真实存在的素材拼进 prompt（占位符一律剔除）
-        content = str(feed.get("content", "") or "")
-        if str(feed.get("rt_con", "") or "").strip():
-            content += f"（转发: {feed['rt_con']}）"
-        for desc in image_material:
-            content += f"[图: {desc}]"
-        dropped = len(feed.get("images") or []) - len(image_material)
         if dropped > 0:
             logger.info(f"说说 {fid} 有 {dropped} 张图未获得有效描述，已从评论素材中剔除")
         try:
-            if has_material and random.random() <= comment_probability:
+            if decision.skip_comment:
+                if decision.reason == "short_at_no_image":
+                    logger.info(f"跳过评论 {fid}：正文仅{decision.plain_content_chars}字、"
+                                f"含@提及且 {dropped} 张图未识别，读不到关系语境，仅点赞")
+                elif decision.reason == "checkin":
+                    logger.info(f"跳过评论 {fid}：打卡/签到类短动态，仅点赞（C4 动态类型分流）")
+            elif has_material and comment_roll_ok:
                 # 人物上下文（昵称+画像）：失败/关闭时静默降级为 QQ 号 / 空画像
                 if person_context_enabled:
                     person_ctx = await fetch_person_context(
@@ -183,7 +251,7 @@ async def process_feeds(
                     comment_prompt_tpl, person_ctx["name"], content,
                     profile=person_ctx["state"])
                 # 生成+发布前检查（发言纪律/净化/拒答/身份错位/语域）一次过。
-                # 纪律段在代码层追加（见 comment_style），不依赖用户可编辑模板——
+                # 纪律段在代码层追加（见 comment_policy），不依赖用户可编辑模板——
                 # config.toml 首跑落盘后不随插件升级更新，写在模板里的规则等于没写。
                 comment_text, reason = await generate_guarded_comment(plugin, prompt)
                 if not comment_text:
@@ -249,8 +317,13 @@ async def run_auto_job(plugin, api, store, reply_manager, atme_manager=None) -> 
             # 图片描述参数尊重 [read] 配置（旧版写死 describe_images=False，
             # 导致自动评论完全"看不到"动态配图，只能凭正文发挥）
             (describe, max_img, conc, comp, edge, q) = _auto_vision_params(plugin)
+            # v1.8.0 P1 延迟识图：开关开启且视觉可用时，拉取阶段只收 URL 不识图，
+            # 由 process_feeds 在「确定要评论」后才下载+VLM。开关默认 True
+            # （代码级默认，老 config.toml 无此字段也生效——边界 B 教训）。
+            lazy = bool(getattr(cfg, "lazy_vision_enabled", True)) and describe
             feeds_list = await api.get_qzone_list(
-                describe_images=describe, max_images=max_img, image_concurrency=conc,
+                describe_images=describe and not lazy,
+                max_images=max_img, image_concurrency=conc,
                 compress=comp, max_edge=edge, quality=q)
             if (isinstance(feeds_list, list) and feeds_list
                     and isinstance(feeds_list[0], dict) and feeds_list[0].get("error")):
@@ -271,6 +344,10 @@ async def run_auto_job(plugin, api, store, reply_manager, atme_manager=None) -> 
                     person_context_enabled=bool(getattr(cfg, "enable_person_context", True)),
                     person_name_field=str(getattr(cfg, "person_name_field", "person_name") or "person_name"),
                     person_state_field=str(getattr(cfg, "person_state_field", "memory_points") or "memory_points"),
+                    short_content_chars=int(getattr(cfg, "short_content_chars", 15) or 15),
+                    policy=_cp.resolve_policy(plugin),
+                    lazy_vision=lazy,
+                    vision_params=(max_img, conc, comp, edge, q),
                 )
                 summary_parts.append(
                     f"处理{stats['handled']}条好友动态（拉取{len(feeds_list)}，赞{stats['liked']}/评{stats['commented']}）")
@@ -339,6 +416,27 @@ class AutoTaskLoop:
         except (AttributeError, TypeError, ValueError):
             return 30
 
+    def _jitter_sec(self) -> float:
+        """P2 随机抖动幅度（秒）。代码级默认 5 分钟（老 config.toml 无此字段也生效）。
+
+        钳制到 interval/2：保证 sleep = interval ± jitter 恒正，
+        且抖动不会把两轮任务挤到一起。填 0 = 完全旧行为。
+        """
+        try:
+            v = float(getattr(self._plugin.config.auto, "interval_jitter_min", 5))
+        except (AttributeError, TypeError, ValueError):
+            v = 5.0
+        v = max(0.0, v)
+        return min(v, self._interval_min() / 2.0) * 60.0
+
+    def _next_sleep_sec(self) -> float:
+        """本轮到下一轮的间隔：interval ± uniform(−jitter, +jitter)。"""
+        base = self._interval_min() * 60.0
+        jitter = self._jitter_sec()
+        if jitter <= 0:
+            return base
+        return base + random.uniform(-jitter, jitter)
+
     def _silent_hours(self) -> str:
         try:
             return str(self._plugin.config.auto.silent_hours or "")
@@ -357,7 +455,7 @@ class AutoTaskLoop:
     async def _loop(self):
         while self.is_running:
             try:
-                await asyncio.sleep(self._interval_min() * 60)
+                await asyncio.sleep(self._next_sleep_sec())
                 if not self._should_run():
                     continue
                 if _is_in_silent_period(self._silent_hours()):

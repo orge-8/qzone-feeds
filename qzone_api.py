@@ -15,7 +15,7 @@ import json
 import re
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import json5
@@ -189,8 +189,95 @@ def _is_allowed_image_host(url: str) -> bool:
     return bool(host) and host.endswith(_QZONE_IMAGE_HOST_SUFFIXES)
 
 
+# 相对图片地址的补全基准（v1.6.0）。
+# 说明：裸路径（如 `/ac/b.gif`）本身不携带 origin，无法还原真实主机，
+# 只能按 HTML 来源页的域名尽力补——补错时得到一个可诊断的 404，
+# 好过原来那个「missing protocol」的必然失败。
+_IMAGE_URL_BASE = "https://user.qzone.qq.com/"
+
+
+def normalize_image_url(url, base: str = _IMAGE_URL_BASE) -> str:
+    """把图片地址补成绝对 URL；无法补全时返回空串。
+
+    真机事故（2026-11-01）：HTML 路径解析出的图片 src 可能是 `/ac/b.gif`
+    这种相对地址，白名单降级后直接交给 httpx，抛
+    「Request URL is missing an 'http://' or 'https://' protocol」，
+    该图描述就此丢失 —— 评论素材残缺，模型于是把残缺内容当完整事实推理。
+
+    处理三种形态：
+    - `//host/path`（协议相对，腾讯 CDN 常见）→ 补 `https:`
+    - `/path` 或 `path`（根相对 / 裸相对）→ 按 base 拼接
+    - `http(s)://…` → 原样返回
+
+    Args:
+        url: 原始地址（可能为 None / 空 / 带空白）
+        base: 拼接地基，默认 Qzone 主域
+
+    Returns:
+        绝对 URL 字符串；无效输入或拼接后无 host 时返回空串。
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    if low.startswith(("http://", "https://")):
+        candidate = raw
+    elif raw.startswith("//"):
+        candidate = "https:" + raw
+    else:
+        candidate = urljoin(base, raw)
+    try:
+        host = urlparse(candidate).hostname
+    except Exception:
+        return ""
+    return candidate if host else ""
+
+
 # 登录类错误码：出现即认为登录态失效
 _LOGIN_ERROR_CODES = {1000000, 1000001, 1000002, 1000003, -3000, -3001, -14}
+
+
+# ── 转发（引用）原作者 ────────────────────────────────────────────────────────
+# 真机事故（2026-11-03）：好友「白菜馅小笼包吖~」转发「牢铁吃了没」的说说，外层正文
+# 写「老大，下次一定能够再见的对吧😭」。v1.6.0 及以前只保留转发正文、丢掉作者名，
+# prompt 变成「好友白菜发了说说：老大，下次一定能够再见的对吧😭（转发: 已经11.3了…）」，
+# 「老大」在上下文里失去所指对象，模型就近认领成"在叫我"，于是替原作者答应了告别：
+# 「当然啦！约定已经种下…下次见时，本姑娘要加倍认真地和你打招呼呀」。
+#
+# 修法不是加词表（换个说法照样越位），而是**把指称对象还给模型**：作者名必须与转发
+# 正文一起进入 prompt。名字取自 HTML 时无需额外请求——它本来就在被 split 丢掉的那半段。
+_RT_AUTHOR_MAX_CHARS = 24
+
+# 作者名可能出现的键（契约未公开，按优先级探测；都不中就返回空，绝不猜）
+_RT_AUTHOR_KEYS = ("rt_uinname", "rt_name", "uinname", "nickname", "name")
+
+
+def _split_rt_author(raw: str) -> tuple[str, str]:
+    """把转发块文本拆成（原作者名, 转发正文）。
+
+    Qzone web 端把转发块渲染为「作者名：正文…」，名字与正文之间是全角冒号。
+    冒号不是分隔符时（名字缺失、正文自带冒号）宁可整段当正文，也不要去猜。
+    """
+    t = str(raw or "").strip()
+    if "：" not in t:
+        return "", t
+    head, tail = t.split("：", 1)
+    head, tail = head.strip(), tail.strip()
+    # 名字段异常（为空 / 过长 / 含换行）说明这个冒号不是作者名分隔符
+    if not head or len(head) > _RT_AUTHOR_MAX_CHARS or "\n" in head:
+        return "", t
+    return head, tail
+
+
+def _extract_rt_author(rt_data: dict) -> str:
+    """从 rt_con 字典里探测原作者名；探测不到返回空串（由调用方决定降级文案）。"""
+    if not isinstance(rt_data, dict):
+        return ""
+    for key in _RT_AUTHOR_KEYS:
+        value = rt_data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 class QzoneAPI:
@@ -250,6 +337,16 @@ class QzoneAPI:
         """
         if not url:
             return None
+        # v1.6.0：先补全相对地址，再做白名单判定。
+        # 顺序不能反——相对地址 urlparse 出来没有 host，会被判成「不在白名单」，
+        # 日志把人引向白名单而非真正的病因（2026-11-01 真机即如此）。
+        raw_url = url
+        url = normalize_image_url(url)
+        if not url:
+            logger.warning(f"图片地址无法补全为绝对 URL，跳过: {raw_url!r}")
+            return None
+        if url != str(raw_url):
+            logger.info(f"图片相对地址已补全: {raw_url!r} -> {url}")
         # 携带 cookie 前先校验域名：图片 URL 来自远端，不可信。
         # 不在白名单 → 不拒绝请求，只是不带 cookie（防凭据外发，同时不误杀配图）。
         send_cookies = bool(with_cookies) and _is_allowed_image_host(url)
@@ -750,16 +847,18 @@ class QzoneAPI:
             content = msg.get("content", "")
 
             # 图片与视频封面 → VLM 描述（并发，保序）
+            # v1.8.0：URL 收集与描述解耦——image_urls 恒返回（延迟识图用），
+            # describe_images=False 时只收集不识别（自动任务先决策后识图）。
+            urls = []
+            for pic in (msg.get("pic") or []):
+                # VLM 只需小图：smallurl 优先（下载字节数比 url1 大图低 5~10 倍）
+                urls.append(pic.get("smallurl") or pic.get("url1") or pic.get("pic_id"))
+            for video in (msg.get("video") or []):
+                urls.append(video.get("url1") or video.get("pic_url"))
+            # 去重（v1.2.8）：同一条说说内重复 URL 会导致同一张图重复下载+重复 VLM
+            urls = list(dict.fromkeys(u for u in urls if u))
             images = []
             if describe_images:
-                urls = []
-                for pic in (msg.get("pic") or []):
-                    # VLM 只需小图：smallurl 优先（下载字节数比 url1 大图低 5~10 倍）
-                    urls.append(pic.get("smallurl") or pic.get("url1") or pic.get("pic_id"))
-                for video in (msg.get("video") or []):
-                    urls.append(video.get("url1") or video.get("pic_url"))
-                # 去重（v1.2.8）：同一条说说内重复 URL 会导致同一张图重复下载+重复 VLM
-                urls = list(dict.fromkeys(u for u in urls if u))
                 images = await self._describe_images(urls, max_images, image_concurrency,
                                                      compress=compress, max_edge=max_edge, quality=quality)
 
@@ -770,11 +869,16 @@ class QzoneAPI:
                 if url:
                     videos.append(url)
 
-            # 转发内容
+            # 转发内容（v1.6.1：作者名与正文一起取）
             rt_con = ""
+            rt_author = ""
             rt_data = msg.get("rt_con") or {}
             if isinstance(rt_data, dict):
-                rt_con = rt_data.get("content", "")
+                rt_con = rt_data.get("content", "") or ""
+                rt_author = _extract_rt_author(rt_data)
+                if rt_con and not rt_author:
+                    # 契约未知：不猜字段，把真实键名打出来，下次真机即知该取哪个
+                    logger.info(f"rt_con 未取到原作者名，可用键={sorted(rt_data.keys())}")
 
             # 评论（含楼中楼）
             def _safe_int(value):
@@ -810,8 +914,10 @@ class QzoneAPI:
                 "created_time": created_time,
                 "content": content,
                 "images": images,
+                "image_urls": urls,
                 "videos": videos,
                 "rt_con": rt_con,
+                "rt_author": rt_author,
                 "comments": comments,
             })
 
@@ -907,13 +1013,12 @@ class QzoneAPI:
                 text_div = soup.find("div", class_="f-info")
                 text = text_div.get_text(strip=True) if text_div else ""
 
-                # 转发内容
+                # 转发内容（v1.6.1：必须连同原作者名一起保留）
                 rt_con = ""
+                rt_author = ""
                 txt_box = soup.select_one("div.txt-box")
                 if txt_box:
-                    rt_con = txt_box.get_text(strip=True)
-                    if "：" in rt_con:
-                        rt_con = rt_con.split("：", 1)[1].strip()
+                    rt_author, rt_con = _split_rt_author(txt_box.get_text(strip=True))
 
                 # 图片URL
                 image_urls = []
@@ -930,6 +1035,8 @@ class QzoneAPI:
                 unique_urls = list(dict.fromkeys(image_urls))
 
                 # VLM 描述（并发，保序）
+                # v1.8.0：describe_images=False 时只返回 image_urls 不识别
+                # （自动任务延迟识图：先决策后识图，省掉注定不评论条目的 VLM）
                 images = []
                 if describe_images:
                     images = await self._describe_images(unique_urls, max_images, image_concurrency,
@@ -978,8 +1085,10 @@ class QzoneAPI:
                     "created_time": created_time,
                     "content": text,
                     "images": images,
+                    "image_urls": unique_urls,
                     "videos": videos,
                     "rt_con": rt_con,
+                    "rt_author": rt_author,
                     "comments": comments_list,
                 })
 

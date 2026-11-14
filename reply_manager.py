@@ -13,8 +13,11 @@ import random
 import re
 import time
 
+from . import comment_policy as _cp
 from .comment_style import (append_style_guard, build_style_retry_prompt,
-                            looks_like_skip, looks_like_stiff_register)
+                            looks_like_romantic_register, looks_like_skip,
+                            looks_like_stiff_register)
+from .host_persona import inject_persona
 
 
 class NoLogger:
@@ -94,7 +97,7 @@ def looks_like_refusal(text: str) -> bool:
     if not text:
         return False
     t = str(text)
-    return any(m in t for m in _REFUSAL_MARKERS)
+    return _cp.looks_like(t, _REFUSAL_MARKERS)
 
 
 # 身份错位特征（v1.2.9 事故）：自动评论是发在**好友**的动态下，好友不是 bot 的主人。
@@ -122,7 +125,13 @@ def looks_like_identity_confusion(text: str) -> bool:
     if not text:
         return False
     t = str(text)
-    return any(m in t for m in _IDENTITY_MARKERS)
+    return _cp.looks_like(t, _IDENTITY_MARKERS)
+
+
+# v1.7.0：词表单一真相源收拢到 comment_policy。上方两组历史词表连同真机事故注释
+# 一并保留（改动记录有独立价值），运行时以 comment_policy 为准，避免两份词表漂移。
+_REFUSAL_MARKERS = _cp._REFUSAL_MARKERS
+_IDENTITY_MARKERS = _cp._IDENTITY_MARKERS
 
 
 def format_comment_time(raw) -> str:
@@ -207,15 +216,16 @@ async def _llm_generate(plugin, prompt: str) -> str:
         return ""
 
 
-async def _one_comment_attempt(plugin, prompt: str) -> tuple[str, str]:
-    """单次生成 + 全部发布前检查。
+async def _one_comment_attempt(plugin, prompt: str, policy=None) -> tuple[str, str]:
+    """单次生成 + 全部发布前检查（判定顺序与规则表收拢在 comment_policy）。
 
     Returns:
         (text, reason)——text 非空表示"可发布"且已净化；
         text 为空串 + reason 表示"不要发布"，reason 供日志诊断：
-        empty / llm_skip / refusal / identity / stiff
+        empty / llm_skip / refusal / identity / romantic / stiff / ok
     """
-    raw = await _llm_generate(plugin, append_style_guard(prompt))
+    policy = policy or _cp.resolve_policy(plugin)
+    raw = await _llm_generate(plugin, append_style_guard(prompt, policy))
     if not raw:
         return "", "empty"
     # 弃评标记在净化**之前**判：净化会剥引号，万一模型写成「"[跳过]"」也能认出来
@@ -224,16 +234,15 @@ async def _one_comment_attempt(plugin, prompt: str) -> tuple[str, str]:
     text = sanitize_llm_output(raw)
     if not text:
         return "", "empty"
-    if looks_like_refusal(text):
-        # 拒答文本绝不能发布（会变成 bot 公开教训好友）
-        return "", "refusal"
-    if looks_like_identity_confusion(text):
-        # 身份错位文本绝不能发布——评论对象是好友不是主人（2026-09-26 事故）
-        return "", "identity"
-    if looks_like_stiff_register(text):
+    # v1.7.0：8 步判定顺序 + 4 类词表 + 命中计数统一走规则表。
+    # 三类 hard 规则（refusal/identity/romantic）在任何配置下都执行（边界 B）。
+    reason, _rule_id = _cp.evaluate(text, policy)
+    if reason == "ok":
+        return text, "ok"
+    if reason == "stiff":
         # 书面通稿腔（2026-10-03 事故）。带文本返回，供调用方重写时当反例
         return text, "stiff"
-    return text, "ok"
+    return "", reason
 
 
 async def generate_guarded_comment(plugin, prompt: str) -> tuple[str, str]:
@@ -243,29 +252,40 @@ async def generate_guarded_comment(plugin, prompt: str) -> tuple[str, str]:
     保证纪律一致——只在某一条路径上修，等于没修。
 
     处理顺序（每一步都不可省）：
-    1. 追加代码级发言纪律（见 comment_style 模块头，绕开用户模板）；
-    2. 生成 → 弃评标记 / 净化 / 拒答 / 身份错位 / 语域 逐项检查；
-    3. 语域不合格时给**一次**重写机会（把不合格句当反例回灌）；
-    4. 重写仍不合格 → 放弃发布（宁可少一条评论，不发通稿腔）。
+    0. 注入宿主人设（语气参考，排在纪律段之前；无宿主配置时不留痕迹）；
+    1. 追加代码级引导（C2 正向样例 + C3 理解校验 + 发言纪律，见 comment_policy）；
+    2. 生成 → 弃评标记 / 净化 / 规则表逐项检查（refusal→identity→romantic→stiff）；
+    3. stiff 时给**一次**重写机会（把不合格句当反例回灌，可配置关闭）；
+    4. 重写仍不合格 → 放弃发布（宁可少一条评论，不发通稿腔）；
+    5. C1：返回前把文本硬截到 policy.max_comment_chars（上限 20 写死）。
+
+    注：人设注入放在本函数而不是三条调用路径里，是为了让"三路统一"
+    由结构保证（只在某条路径上注入，等于三处口吻漂移）。
 
     Returns:
         (text, reason)：text 为空串表示"不要发布"；非空即可直接调发布 API。
     """
-    text, reason = await _one_comment_attempt(plugin, prompt)
+    policy = _cp.resolve_policy(plugin)
+    prompt = await inject_persona(plugin, prompt)
+    text, reason = await _one_comment_attempt(plugin, prompt, policy)
     if reason != "stiff":
         if reason == "llm_skip":
             logger.info("LLM 主动弃评（读不懂/接不上），本条不评论")
-        return text, reason
+        return _cp.clamp_publish_text(text, policy), reason
+
+    if not policy.stiff_retry_enabled:
+        logger.warning("评论语域不合格（书面通稿腔），重写已关闭，放弃发布")
+        return "", "stiff_dropped"
 
     logger.warning(f"评论语域不合格（书面通稿腔），尝试重写: {text[:40]}")
     text2, reason2 = await _one_comment_attempt(
-        plugin, build_style_retry_prompt(prompt, text))
+        plugin, build_style_retry_prompt(prompt, text, policy), policy)
     if reason2 == "stiff":
         logger.warning(f"重写后仍是书面通稿腔，放弃发布: {text2[:40]}")
         return "", "stiff_dropped"
     if reason2 == "ok":
         logger.info(f"重写后合格: {text2}")
-    return text2, reason2
+    return _cp.clamp_publish_text(text2, policy), reason2
 
 
 class ReplyManager:

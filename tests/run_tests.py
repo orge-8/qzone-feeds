@@ -72,6 +72,7 @@ auto_tasks = importlib.import_module("qzf.auto_tasks")
 vision = importlib.import_module("qzf.vision")
 image_compress = importlib.import_module("qzf.image_compress")
 comment_style = importlib.import_module("qzf.comment_style")
+comment_policy = importlib.import_module("qzf.comment_policy")
 person_context = importlib.import_module("qzf.person_context")
 
 
@@ -799,6 +800,239 @@ async def test_person_context():
 
 
 # ============================================================
+# O. 宿主人设注入（bot 自己的人设，只作语气参考）
+# ============================================================
+class _HostCfg:
+    """mock ctx.config：认 personality.personality / personality.reply_style。"""
+
+    def __init__(self, value, style=""):
+        self.values = {"personality.personality": value,
+                       "personality.reply_style": style}
+        self.calls = 0
+        self.calls_by_key = {}
+
+    async def get(self, key, default=None):
+        self.calls += 1
+        self.calls_by_key[key] = self.calls_by_key.get(key, 0) + 1
+        return self.values.get(key, default)
+
+
+class _PersonaSection:
+    def __init__(self, enabled=True, override="", style_override="",
+                 max_chars=600, style_max_chars=300, ttl=600):
+        self.enable_host_persona = enabled
+        self.persona_prompt = override
+        self.reply_style_prompt = style_override
+        self.persona_max_chars = max_chars
+        self.reply_style_max_chars = style_max_chars
+        self.persona_cache_ttl_sec = ttl
+
+
+class _PP:
+    """带 [persona] 段 + ctx.config 的假插件。"""
+
+    def __init__(self, host_value="你是群里的狸猫，说话短、爱吐槽、不用敬语",
+                 host_style="说话平淡简短，不滥用比喻，视情况省略主语",
+                 **persona_kw):
+        self.ctx = types.SimpleNamespace(config=_HostCfg(host_value, host_style))
+        self.config = types.SimpleNamespace(persona=_PersonaSection(**persona_kw))
+
+
+async def test_host_persona():
+    section("O. 宿主人设注入")
+    hp = importlib.import_module("qzf.host_persona")
+    orig_llm = reply_manager._llm_generate
+    hp.reset_persona_cache()
+
+    async def fake_llm(_p, prompt):
+        return "模拟评论"
+
+    reply_manager._llm_generate = fake_llm
+    try:
+        # O01 主路径：宿主人设 + 表达风格都进 prompt，且是"风格参考"不是"你是X"
+        p = _PP()
+        out = await hp.inject_persona(p, "好友X发了说说：Y。")
+        check("O01 宿主人设注入 prompt", "说话短、爱吐槽" in out and hp.PERSONA_MARKER in out, out[:80])
+        check("O01c 表达风格注入 prompt",
+              "不滥用比喻" in out and hp.REPLY_STYLE_MARKER in out, out[:160])
+        # 我们自己拼的模板不得包含自称句（宿主原文里的"你是"不算账）
+        hp.reset_persona_cache()
+        out1b = await hp.inject_persona(
+            _PP(host_value="群里的狸猫，说话短、爱吐槽", host_style=""), "素材。")
+        check("O01b 注入模板不自称（避免自我指涉致通稿腔）",
+              "你是" not in out1b and "以…身份" not in out1b, out1b[:120])
+
+        # O02 纪律段必须排在人设之后（末尾约束力最强）
+        guarded = comment_style.append_style_guard(out)
+        check("O02 发言纪律位于人设之后",
+              guarded.index(hp.PERSONA_MARKER) < guarded.index("【发言纪律"), guarded[:60])
+
+        # O03 覆盖项优先于宿主（persona_prompt 非空 = 整体接管）
+        hp.reset_persona_cache()
+        p3 = _PP(override="你是一只懒散的猫，只用句号结尾")
+        out3 = await hp.inject_persona(p3, "素材。")
+        check("O03 persona_prompt 覆盖宿主",
+              "懒散的猫" in out3 and "爱吐槽" not in out3, out3[:100])
+        check("O03b 整体接管时不读宿主（含风格）",
+              p3.ctx.config.calls == 0, f"calls={p3.ctx.config.calls}")
+
+        # O04 开关关闭 → 完全不注入，prompt 原样
+        hp.reset_persona_cache()
+        p4 = _PP(enabled=False)
+        src4 = "好友X发了说说：Y。"
+        out4 = await hp.inject_persona(p4, src4)
+        check("O04 开关关闭：prompt 原样返回", out4 == src4, out4[:60])
+        check("O04b 开关关闭：不读宿主", p4.ctx.config.calls == 0, f"calls={p4.ctx.config.calls}")
+
+        # O05 宿主返回非字符串（键缺失时的 None / {}）→ 空，不得留下 "{}"
+        for bad in (None, {}, [], 123):
+            hp.reset_persona_cache()
+            out5 = await hp.inject_persona(_PP(host_value=bad, host_style=""), "素材。")
+            ok5 = out5 == "素材。" and "{}" not in out5
+            check(f"O05 非字符串({type(bad).__name__})：静默不注入", ok5, out5[:60])
+
+        # O06 宿主读取抛异常 → 静默降级
+        class _BoomCfg:
+            async def get(self, key, default=None):
+                raise RuntimeError("host rpc 挂了")
+
+        hp.reset_persona_cache()
+        p6 = _PP()
+        p6.ctx.config = _BoomCfg()
+        check("O06 读取异常：静默不注入", await hp.inject_persona(p6, "素材。") == "素材。")
+
+        # O07 无 ctx.config（旧 SDK / stub 环境）
+        hp.reset_persona_cache()
+        p7 = types.SimpleNamespace(ctx=types.SimpleNamespace(),
+                                   config=types.SimpleNamespace(persona=_PersonaSection()))
+        check("O07 无 ctx.config：静默不注入", await hp.inject_persona(p7, "素材。") == "素材。")
+
+        # O07b plugin=None（测试里 process_feeds(None, ...) 的既有用法）
+        check("O07b plugin=None：原样返回", await hp.inject_persona(None, "素材。") == "素材。")
+
+        # O08 截断：长人设按句截断到上限附近，不留半句
+        hp.reset_persona_cache()
+        long_persona = "是一个很长的人设句子。" * 200
+        out8 = await hp.inject_persona(
+            _PP(host_value=long_persona, host_style="", max_chars=600), "素材。")
+        body8 = out8.split(hp.PERSONA_MARKER)[1].split("\n（")[0]
+        check("O08 长人设按句截断", 500 <= len(body8) <= 602, f"len={len(body8)}")
+        check("O08b 截断有省略号且不留半句",
+              body8.endswith("。…") or body8.endswith("…"), body8[-12:])
+
+        # O08c max_chars<=0 表示不截断
+        hp.reset_persona_cache()
+        out8c = await hp.inject_persona(
+            _PP(host_value="短人设。", host_style="", max_chars=0), "素材。")
+        check("O08c max_chars=0：不截断", "短人设。" in out8c)
+
+        # O09 TTL 缓存：连续两次注入，每个宿主键只读一次
+        hp.reset_persona_cache()
+        p9 = _PP(ttl=600)
+        await hp.inject_persona(p9, "素材1。")
+        await hp.inject_persona(p9, "素材2。")
+        check("O09 TTL 缓存：两次注入每个键只读一次",
+              p9.ctx.config.calls_by_key == {"personality.personality": 1,
+                                             "personality.reply_style": 1},
+              str(p9.ctx.config.calls_by_key))
+
+        # O09b 空结果也缓存（负缓存），避免每条评论都撞 Host
+        hp.reset_persona_cache()
+        p9b = _PP(host_value="", host_style="", ttl=600)
+        await hp.inject_persona(p9b, "素材1。")
+        await hp.inject_persona(p9b, "素材2。")
+        check("O09b 空人设负缓存：每键只读一次", p9b.ctx.config.calls == 2,
+              f"calls={p9b.ctx.config.calls}")
+
+        # O10 幂等：重复注入只出现一段
+        hp.reset_persona_cache()
+        p10 = _PP()
+        once = await hp.inject_persona(p10, "素材。")
+        twice = await hp.inject_persona(p10, once)
+        check("O10 重复注入幂等",
+              twice == once and twice.count(hp.PERSONA_MARKER) == 1
+              and twice.count(hp.REPLY_STYLE_MARKER) == 1,
+              f"人设标记={twice.count(hp.PERSONA_MARKER)} 风格标记={twice.count(hp.REPLY_STYLE_MARKER)}")
+
+        # O13 只有表达风格（宿主没人设）→ 只渲染风格段
+        hp.reset_persona_cache()
+        out13 = await hp.inject_persona(_PP(host_value="", host_style="话很短，爱用语气词"), "素材。")
+        check("O13 只有风格：渲染风格段且无空人设段",
+              hp.REPLY_STYLE_MARKER in out13 and hp.PERSONA_MARKER not in out13
+              and "话很短" in out13, out13[:120])
+
+        # O14 只有人设（宿主没配 reply_style）→ 不留风格空段
+        hp.reset_persona_cache()
+        out14 = await hp.inject_persona(_PP(host_value="狸猫", host_style=""), "素材。")
+        check("O14 只有人设：不留风格空段",
+              hp.PERSONA_MARKER in out14 and hp.REPLY_STYLE_MARKER not in out14, out14[:120])
+
+        # O15 风格超长按句截断到上限
+        # v1.6.0 起风格段有硬上限 100（_STYLE_MAX_CHARS_CEILING），
+        # 所以这里按新上限断言；「配置写 300 被钳制」由 N14 单独覆盖。
+        hp.reset_persona_cache()
+        out15 = await hp.inject_persona(
+            _PP(host_value="", host_style="说话很平淡。" * 100, style_max_chars=100), "素材。")
+        style15 = out15.split(hp.REPLY_STYLE_MARKER)[1].split("\n（")[0]
+        check("O15 风格按句截断到上限", 40 <= len(style15) <= 102, f"len={len(style15)}")
+
+        # O16 reply_style_prompt 只换风格，人设仍读宿主
+        hp.reset_persona_cache()
+        p16 = _PP(style_override="只回表情")
+        out16 = await hp.inject_persona(p16, "素材。")
+        check("O16 风格覆盖项生效且人设仍来自宿主",
+              "只回表情" in out16 and "爱吐槽" in out16 and "不滥用比喻" not in out16,
+              out16[:160])
+        check("O16b 只读人设键、不读风格键",
+              p16.ctx.config.calls_by_key == {"personality.personality": 1},
+              str(p16.ctx.config.calls_by_key))
+
+        # O17 风格返回非字符串 → 静默，只剩人设
+        hp.reset_persona_cache()
+        out17 = await hp.inject_persona(_PP(host_style={"a": 1}), "素材。")
+        check("O17 风格非字符串：静默且不影响人设",
+              "爱吐槽" in out17 and hp.REPLY_STYLE_MARKER not in out17
+              and "{'a'" not in out17, out17[:140])
+
+        # O18 人设与风格两段都必须排在纪律之前
+        hp.reset_persona_cache()
+        guarded18 = comment_style.append_style_guard(
+            await hp.inject_persona(_PP(), "素材。"))
+        check("O18 人设与风格都位于发言纪律之前",
+              guarded18.index(hp.PERSONA_MARKER) < guarded18.index("【发言纪律")
+              and guarded18.index(hp.REPLY_STYLE_MARKER) < guarded18.index("【发言纪律"), "")
+
+        # O11 真机端到端：自动评论路径的 prompt 里确实带上了人设
+        hp.reset_persona_cache()
+        captured = {}
+
+        async def cap_llm(_p, prompt):
+            captured["p"] = prompt
+            return "模拟评论"
+
+        reply_manager._llm_generate = cap_llm
+        store11, api11 = _FakeStore(), _FakeApi()
+        await auto_tasks.process_feeds(_PP(), api11, store11,
+                                       [{"target_qq": "20001", "tid": "o11", "content": "今天好累",
+                                         "rt_con": "", "images": [], "videos": [], "comments": []}],
+                                       like_probability=0, comment_probability=1.0,
+                                       action_interval=0)
+        check("O11 自动评论路径人设生效（端到端）",
+              "说话短、爱吐槽" in captured.get("p", ""), captured.get("p", "")[:100])
+
+        # O12 结构锁：人设只在一处注入（三条路径共用），不得各写一遍
+        srcs = {f: (Path(PLUGIN_DIR) / f).read_text(encoding="utf-8")
+                for f in ("auto_tasks.py", "reply_manager.py", "atme_manager.py")}
+        call_sites = [f for f, t in srcs.items()
+                      if "await inject_persona(" in t]
+        check("O12 人设注入只落在 reply_manager 单点", call_sites == ["reply_manager.py"],
+              str(call_sites))
+    finally:
+        reply_manager._llm_generate = orig_llm
+        hp.reset_persona_cache()
+
+
+# ============================================================
 # H. 自动任务图片参数（回归：自动评论能"看到"动态配图）
 # ============================================================
 class _CfgSection:
@@ -849,13 +1083,16 @@ async def test_auto_job_vision_params():
     section("H. 自动任务图片参数")
     at = auto_tasks
 
-    # 1. 配置开启 → describe_images=True 且限额透传
+    # 1. 配置开启 → 视觉链路启用且限额透传。
+    # v1.8.0 起默认延迟识图：拉取阶段 describe_images=False（只收 URL），
+    # 识图推迟到 process_feeds「确定要评论」之后；H01 语义改为断言视觉链路
+    # 启用（lazy_vision_enabled=False 的旧行为由 V02 覆盖）。
     p = _AutoPlugin(read_kw=dict(enable_image_description=True, max_images_per_feed=4,
                                  image_concurrency=2, image_max_edge=768, image_quality=60))
     api = _AutoApi()
     await at.run_auto_job(p, api, _FakeStore(), None)
-    check("H01 自动任务尊重 read.enable_image_description=True",
-          api.calls and api.calls[0].get("describe_images") is True,
+    check("H01 自动任务尊重 read.enable_image_description=True（默认延迟识图）",
+          api.calls and api.calls[0].get("describe_images") is False,
           f"实际参数：{api.calls[0] if api.calls else '未调用'}")
     check("H02 图片限额透传（max_images/concurrency/edge/quality）",
           api.calls and api.calls[0].get("max_images") == 4
@@ -1823,6 +2060,8 @@ def test_manifest():
     need = {"send.text", "llm.generate", "api.call"}
     check("F15 capabilities 覆盖 send/llm/api",
           need.issubset(set(caps)), str(caps))
+    check("F15b capabilities 声明 config.get（读宿主人设必需）",
+          "config.get" in caps, str(caps))
     deps = {d.get("id") or d.get("name") for d in m.get("dependencies", [])}
     check("F16 依赖声明含 snowluma-adapter/httpx/json5/bs4/pillow",
           {"maibot-team.snowluma-adapter", "httpx", "json5",
@@ -2188,6 +2427,7 @@ async def _amain():
     test_image_size_cap()
     await test_comment_material_guard()
     await test_person_context()
+    await test_host_persona()
     await test_auto_job_vision_params()
     await test_lifecycle()
     test_resolve_llm_params()
@@ -2210,7 +2450,637 @@ async def _amain():
     test_stiff_register_detection()
     await test_style_guard_not_published()
     test_style_wiring_lock()
+    test_romantic_register_detection()
+    await test_romantic_not_published()
+    await test_missing_image_disclosure()
+    test_reply_style_char_ceiling()
+    test_image_url_normalize()
+    test_rt_author_split()
+    await test_rt_author_in_prompt()
     test_manifest()
+    await test_comment_policy_v170()
+    await test_lazy_vision_v180()
+
+
+# ============================================================
+# N. 亲昵/恋爱语域拦截（真机事故 2026-11-01）
+#    好友说说「@onthrpww 宝宝我爱你」→ bot 评论「宝宝这句我收下啦！本姑娘也爱你呀～」
+# ============================================================
+_ROMANTIC_SAMPLES = [
+    "宝宝这句我收下啦！本姑娘也爱你呀～",  # 2026-11-01 真机原文
+    "我也爱你呀",                          # 无称呼，与事故句同性质
+    "宝贝今天也想你了",
+    "亲亲你，早点睡",
+    "老婆这条太好笑了",
+]
+
+
+def test_romantic_register_detection():
+    section("N. 亲昵语域拦截")
+    f = comment_style.looks_like_romantic_register
+
+    for i, s in enumerate(_ROMANTIC_SAMPLES, 1):
+        check(f"N1-{i} 亲昵语域命中: {s[:14]}", f(s) is True)
+
+    ok_samples = [
+        "大佬这操作也太秀了吧！",
+        "老板何时更新呀，蹲一个",
+        "这图也太好看了吧，求出处！",
+        "没看懂，啥意思",
+        "恭喜恭喜，终于搞定啦",
+    ]
+    bad = [s for s in ok_samples if f(s)]
+    check("N2 常规评论不误判", not bad, f"误判：{bad}" if bad else "全部正常")
+    check("N3 空文本不误判", f("") is False and f(None) is False)
+    # 设计取舍（有意为之，不是缺陷）：「单命中即拦」会把「宝宝今天吃了吗」也拦掉。
+    # 宁可少一条评论，也不要冒一次公开越界的风险。
+    check("N4 「宝宝今天吃了吗」亦被拦（单命中策略的有意取舍）",
+          f("宝宝今天吃了吗") is True)
+
+
+async def test_romantic_not_published():
+    """N5~N7：亲昵语域文本不得发布，且不给重写机会。"""
+    section("N. 亲昵语域不发布")
+    orig = reply_manager._llm_generate
+    calls = {"n": 0}
+
+    async def romantic_llm(plugin, prompt):
+        calls["n"] += 1
+        return _ROMANTIC_SAMPLES[0]
+
+    reply_manager._llm_generate = romantic_llm
+    try:
+        store, api = _FakeStore(), _FakeApi()
+        await auto_tasks.process_feeds(
+            None, api, store,
+            [{"tid": "rm1", "target_qq": "20001", "videos": [], "comments": [],
+              "rt_con": "", "images": [],
+              "content": "(震惊)(感动)@onthrpww 宝宝我爱你❤️❤️这条正文足够长所以不会触发短正文降级"}],
+            like_probability=1.0, comment_probability=1.0, action_interval=0)
+        check("N5 亲昵语域评论不发布", not api.comments,
+              f"却发了：{api.comments[:1]}" if api.comments else "已拦截")
+        check("N6 拦截后点赞仍执行", api.likes == ["rm1"], f"likes={api.likes}")
+        check("N7 不给重写机会（仅 1 次 LLM 调用）", calls["n"] == 1, f"n={calls['n']}")
+    finally:
+        reply_manager._llm_generate = orig
+
+
+async def test_missing_image_disclosure():
+    """N8~N12：缺图必须让模型知道 + 短正文缺图降级只点赞。"""
+    section("N. 缺图披露与短正文降级")
+    orig = reply_manager._llm_generate
+    captured = {}
+
+    async def capture_llm(plugin, prompt):
+        captured["p"] = prompt
+        return "好家伙"
+
+    async def run(feed):
+        store, api = _FakeStore(), _FakeApi()
+        await auto_tasks.process_feeds(None, api, store, [feed],
+                                       like_probability=1.0, comment_probability=1.0,
+                                       action_interval=0)
+        return api
+
+    reply_manager._llm_generate = capture_llm
+    try:
+        # N8/N9：正文够长 → 照评，但 prompt 必须明示有图没读到
+        await run({"tid": "mi1", "target_qq": "20001", "videos": [], "comments": [],
+                   "rt_con": "", "images": ["[图片（加载失败）]"],
+                   "content": "(震惊)(感动)@onthrpww 宝宝我爱你，这条正文足够长所以照常评论"})
+        p = captured.get("p", "")
+        check("N8 缺图时 prompt 显式告知未识别的图", "未能识别" in p,
+              p[-90:] if p else "prompt 为空")
+        check("N9 占位符本身仍不进 prompt", "[图片（加载失败）]" not in p, p[:120])
+
+        # N10/N11：正文极短 + 缺图 → 只点赞不评论
+        captured.clear()
+        api2 = await run({"tid": "mi2", "target_qq": "20002", "videos": [], "comments": [],
+                          "rt_con": "", "images": ["[图片（加载失败）]"],
+                          "content": "@onn 嗯"})
+        check("N10 短正文+缺图 → 不评论", not api2.comments,
+              f"却发了：{api2.comments[:1]}" if api2.comments else "已降级")
+        check("N11 短正文+缺图 → 点赞照做", api2.likes == ["mi2"], f"likes={api2.likes}")
+        check("N11b 降级时根本不调 LLM", "p" not in captured, "多余调用了 LLM")
+
+        # N12：短正文 + 缺图，但正文**没有 @ 任何人** → 不降级。
+        # v1.2.2 立的规矩是「图挂了不该拖累正常评论」，本规则只针对
+        # 「这句话在跟某个具体的人说、而关系语境全在那张看不见的图里」。
+        api3 = await run({"tid": "mi3", "target_qq": "20003", "videos": [], "comments": [],
+                          "rt_con": "", "images": ["[图片（加载失败）]"], "content": "好耶"})
+        check("N12 短正文+缺图但无@ → 照常评论（不推倒 v1.2.2）",
+              api3.comments == ["好家伙"], f"comments={api3.comments}")
+    finally:
+        reply_manager._llm_generate = orig
+
+
+def test_reply_style_char_ceiling():
+    """N13~N15：表达风格段硬上限 100——老实例 config.toml 写着 300 也必须生效。"""
+    section("N. 风格段字数上限")
+    hp = importlib.import_module("qzf.host_persona")
+
+    check("N13 风格段默认上限为 100", hp._DEFAULT_REPLY_STYLE_MAX_CHARS == 100,
+          f"={hp._DEFAULT_REPLY_STYLE_MAX_CHARS}")
+
+    class _Old:
+        """模拟已落盘的老实例配置（v1.5.0 写的是 300）。"""
+
+        class config:
+            class persona:
+                enable_host_persona = True
+                persona_prompt = ""
+                reply_style_prompt = ""
+                persona_max_chars = 600
+                reply_style_max_chars = 300
+                persona_cache_ttl_sec = 600
+
+    cfg = hp._persona_cfg(_Old())
+    check("N14 老配置的 300 被钳制到 100", cfg["style_max_chars"] == 100,
+          f"={cfg['style_max_chars']}")
+
+    out = hp.truncate_persona("甲" * 400, cfg["style_max_chars"])
+    check("N15 截断后不超过上限（含省略号）", len(out) <= 101, f"len={len(out)}")
+
+
+def test_image_url_normalize():
+    """N16~N20：相对图片地址补全（/ac/b.gif 事故）。"""
+    section("N. 图片地址补全")
+    f = qzone_api.normalize_image_url
+
+    check("N16 协议相对地址补 https", f("//m.qpic.cn/a.jpg") == "https://m.qpic.cn/a.jpg",
+          f("//m.qpic.cn/a.jpg"))
+    got = f("/ac/b.gif")
+    check("N17 根相对地址按 base 拼接为绝对 URL",
+          got.startswith("https://") and got.endswith("/ac/b.gif"), got)
+    check("N18 绝对地址原样返回",
+          f("https://p.qpic.cn/x.png") == "https://p.qpic.cn/x.png")
+    check("N19 空值返回空串", f("") == "" and f(None) == "")
+    check("N20 补全后能通过白名单判定（顺序修正的验证）",
+          qzone_api._is_allowed_image_host(got) is True, got)
+
+
+# ============================================================
+# S. 转发归属（真机事故 2026-11-03）
+#    白菜转发牢铁的说说写「老大，下次一定能够再见的对吧😭」→ bot 回
+#    「当然啦！约定已经种下…下次见时，本姑娘要加倍认真地和你打招呼呀」
+#    根因：转发只带正文不带原作者名，「老大」失去所指对象，模型就近认领成"在叫我"。
+# ============================================================
+def test_rt_author_split():
+    section("S. 转发归属")
+    split = qzone_api._split_rt_author
+
+    got = split("牢铁吃了没：已经11.3了\n我正坐在教室的木椅...")
+    check("S01 拆出原作者名", got == ("牢铁吃了没", "已经11.3了\n我正坐在教室的木椅..."), got)
+
+    got = split("没有冒号的转发正文")
+    check("S02 无冒号→整段当正文，不猜作者", got == ("", "没有冒号的转发正文"), got)
+
+    got = split("：只有冒号")
+    check("S03 名字段为空→不认这个冒号", got == ("", "：只有冒号"), got)
+
+    long_name = "零" * 40
+    got = split(f"{long_name}：正文")
+    check("S04 名字段过长→大概率不是名字，整段当正文",
+          got == ("", f"{long_name}：正文"), got[:1])
+
+    got = split(None)
+    check("S05 None 不报错", got == ("", ""), got)
+
+    # __extract_rt_author：键名契约未公开，按优先级探测
+    ex = qzone_api._extract_rt_author
+    check("S06 命中 rt_uinname", ex({"rt_uinname": "牢铁吃了没", "content": "c"}) == "牢铁吃了没")
+    check("S07 缺 rt_uinname 时回退 nickname", ex({"nickname": " A "}) == "A")
+    check("S08 全不中→空串（不猜）", ex({"content": "c", "uin": 123}) == "")
+    check("S09 非 dict 不报错", ex(None) == "" and ex("x") == "")
+
+
+async def test_rt_author_in_prompt():
+    """S10~S14：原作者名与截断披露必须真的进 prompt。"""
+    at = auto_tasks
+    orig_llm = reply_manager._llm_generate
+    captured = {}
+
+    async def cap_llm(plugin_, prompt):
+        captured["p"] = prompt
+        return "好呀老大，下次见"
+
+    reply_manager._llm_generate = cap_llm
+    try:
+        base = {"target_qq": "20001", "videos": [], "comments": []}
+
+        async def run(feed):
+            store, api = _FakeStore(), _FakeApi()
+            await at.process_feeds(None, api, store, [feed],
+                                   like_probability=0.0, comment_probability=1.0,
+                                   action_interval=0)
+            return api
+
+        # 事故复现：外层正文点「老大」，转发正文来自别人
+        await run({**base, "tid": "s1",
+                   "content": "老大，下次一定能够再见的对吧😭",
+                   "rt_con": "已经11.3了 我正坐在教室的木椅", 
+                   "rt_author": "牢铁吃了没", "images": []})
+        p = captured.get("p", "")
+        check("S10 prompt 含原作者名（「老大」这才有归属）",
+              "转发 牢铁吃了没 的说说" in p, p[:120])
+        check("S11 作者名出现在正文位而非指令位", "好友20001发了说说" in p)
+
+        # 拿不到作者名时也必须明示"这是别人的内容"
+        await run({**base, "tid": "s2", "content": "老大说得对",
+                   "rt_con": "已经11.3了", "rt_author": "", "images": []})
+        p = captured.get("p", "")
+        check("S12 作者名缺失→降级为「转发别人的说说」",
+              "转发别人的说说" in p, p[:120])
+        check("S13 不再出现旧格式「（转发: 」", "（转发: " not in p, p[:120])
+
+        # 截断自证：尾部省略号才披露
+        await run({**base, "tid": "s3", "content": "",
+                   "rt_con": "清晨的风夹着凉雨敲着窗 ...", "rt_author": "牢铁吃了没",
+                   "images": []})
+        p = captured.get("p", "")
+        check("S14 尾部省略号→追加「查看全文」折叠披露",
+              "查看全文" in p and "猜后半段" in p, p[:160])
+
+        await run({**base, "tid": "s4", "content": "",
+                   "rt_con": "清晨的风夹着凉雨敲着窗，屋里很安静。", "rt_author": "牢铁吃了没",
+                   "images": []})
+        p = captured.get("p", "")
+        check("S15 无省略号→不加披露（不塞用不上的元信息）",
+              "查看全文" not in p, p[:160])
+
+        check("S16 _rt_looks_truncated 判定",
+              at._rt_looks_truncated("abc…") is True
+              and at._rt_looks_truncated("abc。。。") is True
+              and at._rt_looks_truncated("abc。") is False
+              and at._rt_looks_truncated("") is False)
+    finally:
+        reply_manager._llm_generate = orig_llm
+
+    # 命令侧展示：转发连同作者一起显示
+    s = plugin.format_feed({"target_qq": "123", "created_time": "t", "content": "正文",
+                            "rt_con": "原内容", "rt_author": "牢铁吃了没",
+                            "images": [], "videos": [], "comments": []}, 1)
+    check("S17 /说说 展示含原作者名", "转发 牢铁吃了没" in s, s[:80])
+
+
+# ============================================================
+# U. v1.7.0 评论决策规则层（C1~C5 行为变更验收）
+#     Q5 口径：只补最小回归用例，不做 L0 语料/影子模式/埋点
+# ============================================================
+async def test_comment_policy_v170():
+    section("U. v1.7.0 评论决策规则层")
+    cp = comment_policy
+    cs = comment_style
+
+    # C1 发布字数代码级钳制：配置越界也只认 20；净化步骤不受影响
+    long_text = "好" * 50
+    check("U01 C1 默认发布文本硬截到 20 字",
+          len(cp.clamp_publish_text(long_text)) == 20,
+          f"len={len(cp.clamp_publish_text(long_text))}")
+    check("U02 C1 配置填 100 仍钳到 20 字（上限代码级写死）",
+          len(cp.clamp_publish_text(long_text, cp.Policy(max_comment_chars=100))) == 20)
+    check("U03 C1 只钳最终发布文本，净化默认仍是 100 字（A16 结构锁）",
+          len(reply_manager.sanitize_llm_output("あ" * 500)) == 100
+          and len(reply_manager.sanitize_llm_output(long_text)) == 50)
+
+    # C2 正向 few-shot / C3 理解校验：开启时都进 prompt，纪律段恒在最末
+    g_on = cs.append_style_guard("好友X发了说说：Y。")
+    check("U04 C2 正向 few-shot 进 prompt", cp.FEW_SHOT in g_on)
+    check("U05 C3 理解校验进 prompt", cp.UNDERSTANDING_CHECK in g_on)
+    check("U06 C2/C3 追加后纪律段仍在 prompt 最末（O05/O18 顺序锁）",
+          g_on.endswith(cs.STYLE_GUARD))
+    g_off = cs.append_style_guard("好友X发了说说：Y。", cp.Policy(enabled=False))
+    check("U07 总开关关闭只影响新增引导，纪律段与硬拦截不减",
+          cp.FEW_SHOT not in g_off and cp.UNDERSTANDING_CHECK not in g_off
+          and g_off.endswith(cs.STYLE_GUARD))
+
+    # C4 动态类型分流：打卡类降级，话题类短说说不受影响
+    checkin = {"content": "今日打卡", "rt_con": "", "images": []}
+    topic = {"content": "五维介质新企划", "rt_con": "", "images": []}
+    check("U08 C4 打卡类判 checkin、话题类短说说仍 normal（不误伤）",
+          cp.classify_feed(checkin) == "checkin" and cp.classify_feed(topic) == "normal")
+    d_on = cp.decide_material(checkin, policy=cp.Policy(enabled=True))
+    d_off = cp.decide_material(checkin, policy=cp.Policy(enabled=False))
+    check("U09 C4 decide_material 打卡类降级、总开关关闭后不降级",
+          d_on.skip_comment and d_on.reason == "checkin"
+          and not d_off.skip_comment and d_off.has_material)
+
+    # C5 有序规则表 + 命中计数；边界 B 三类硬兜底恒生效
+    check("U10 C5 规则表顺序固化 refusal→identity→romantic→stiff",
+          tuple(r.id for r in cp.RULES) == ("refusal", "identity", "romantic", "stiff"))
+    check("U11 边界B 三类硬兜底恒生效（无任何配置字段可关）",
+          all(cp.is_hard_rule(x) for x in cp.HARD_RULE_IDS)
+          and not cp.is_hard_rule("stiff")
+          and tuple(r.hard for r in cp.RULES[:3]) == (True, True, True))
+    cp.reset_hit_counts()
+    p_cnt = cp.Policy(enabled=False, hit_counter_enabled=True)
+    r1, id1 = cp.evaluate("我不能提供这个", p_cnt)
+    r2, id2 = cp.evaluate("双喜临门", p_cnt)
+    r3, _ = cp.evaluate("哈哈好呀", p_cnt)
+    check("U12 C5 命中计数只记命中规则，且开关关闭不减少任何拦截",
+          (r1, id1) == ("refusal", "refusal")
+          and (r2, id2) == ("stiff", "stiff") and r3 == "ok"
+          and cp.get_hit_counts() == {"refusal": 1, "stiff": 1},
+          str(cp.get_hit_counts()))
+
+    # 策略解析：plugin=None 与配置越界都必须安全退回（测试与老 config.toml 实例）
+    p_none = cp.resolve_policy(None)
+    fake = types.SimpleNamespace(config=types.SimpleNamespace(auto=types.SimpleNamespace(
+        comment_policy_enabled=False, max_comment_chars=999,
+        stiff_retry_enabled=False, rule_hit_counter_enabled=True)))
+    p_fake = cp.resolve_policy(fake)
+    check("U13 resolve_policy：None 安全默认、越界配置钳到 20、开关生效",
+          p_none.enabled and p_none.max_comment_chars == 20
+          and p_none.stiff_retry_enabled and not p_none.hit_counter_enabled
+          and p_fake.max_comment_chars == 20 and not p_fake.enabled
+          and not p_fake.stiff_retry_enabled and p_fake.hit_counter_enabled)
+
+
+# ============================================================
+# V. v1.8.0 性能与流程优化（P1 延迟识图 / P2 抖动 / P3 双保险判重）
+# ============================================================
+class _VisionApi:
+    """mock QzoneAPI：记录延迟识图调用，返回预置描述。"""
+
+    def __init__(self, uin="10001", desc="一只橘猫趴在键盘上"):
+        self.uin = uin
+        self.desc = desc
+        self.describe_calls = []
+        self.comments = []
+        self.likes = []
+
+    async def _describe_images(self, urls, max_images, concurrency, **kw):
+        self.describe_calls.append(list(urls))
+        return [self.desc] * len(urls)
+
+    async def comment(self, fid, qq, text):
+        self.comments.append((fid, text))
+        return True
+
+    async def like(self, fid, qq):
+        self.likes.append(fid)
+        return True
+
+
+async def test_lazy_vision_v180():
+    section("V. v1.8.0 延迟识图 / 抖动 / 双保险判重")
+    at = auto_tasks
+    orig_llm = reply_manager._llm_generate
+
+    async def fake_llm(plugin, prompt):
+        return "模拟评论"
+
+    reply_manager._llm_generate = fake_llm
+    base = {"target_qq": "20001", "videos": [], "comments": []}
+    try:
+        # ── P1 延迟识图 ──────────────────────────────────────────────
+        # V01 概率通过 → 先识图再评论，描述进 prompt
+        captured = {}
+
+        async def cap_llm(_p, prompt):
+            captured["p"] = prompt
+            return "模拟评论"
+
+        reply_manager._llm_generate = cap_llm
+        api = _VisionApi()
+        store = _FakeStore()
+        feed = {**base, "tid": "v1", "content": "看看我家猫", "rt_con": "",
+                "images": [], "image_urls": ["https://qzone.example/a.jpg"]}
+        await at.process_feeds(None, api, store, [feed],
+                               like_probability=0, comment_probability=1.0,
+                               action_interval=0, lazy_vision=True)
+        check("V01 延迟识图：概率通过才识图，描述进素材",
+              api.describe_calls == [["https://qzone.example/a.jpg"]]
+              and len(api.comments) == 1
+              and "[图: 一只橘猫趴在键盘上]" in captured.get("p", ""),
+              f"识图调用={api.describe_calls} prompt={captured.get('p', '')[:80]}")
+
+        # V02 概率弃评 → 不识图，点赞不受影响
+        api2 = _VisionApi()
+        feed2 = {**base, "tid": "v2", "content": "看看我家猫", "rt_con": "",
+                 "images": [], "image_urls": ["https://qzone.example/b.jpg"]}
+        await at.process_feeds(None, api2, _FakeStore(), [feed2],
+                               like_probability=1.0, comment_probability=0.0,
+                               action_interval=0, lazy_vision=True)
+        check("V02 延迟识图：概率弃评不识图，点赞照常",
+              not api2.describe_calls and not api2.comments and api2.likes == ["v2"],
+              f"识图调用={api2.describe_calls}")
+
+        # V03 已处理条目 → 不识图（稳态省重复下载的核心）
+        api3 = _VisionApi()
+        store3 = _FakeStore()
+        await store3.mark_processed("v3")
+        feed3 = {**base, "tid": "v3", "content": "旧说说", "rt_con": "",
+                 "images": [], "image_urls": ["https://qzone.example/c.jpg"]}
+        await at.process_feeds(None, api3, store3, [feed3],
+                               like_probability=1.0, comment_probability=1.0,
+                               action_interval=0, lazy_vision=True)
+        check("V03 延迟识图：已处理条目零识图零操作",
+              not api3.describe_calls and not api3.comments and not api3.likes)
+
+        # V04 lazy_vision=False（命令路径）→ 不触发延迟识图，images 原样用
+        api4 = _VisionApi()
+        feed4 = {**base, "tid": "v4", "content": "命令路径", "rt_con": "",
+                 "images": ["已有描述"], "image_urls": ["https://qzone.example/d.jpg"]}
+        await at.process_feeds(None, api4, _FakeStore(), [feed4],
+                               like_probability=0, comment_probability=1.0,
+                               action_interval=0, lazy_vision=False)
+        check("V04 命令路径（lazy=False）不重复识图",
+              not api4.describe_calls and len(api4.comments) == 1)
+
+        # V05 无图无素材 → 不识图不评论（素材守卫在延迟路径同样生效）
+        api5 = _VisionApi()
+        feed5 = {**base, "tid": "v5", "content": "", "rt_con": "",
+                 "images": [], "image_urls": []}
+        await at.process_feeds(None, api5, _FakeStore(), [feed5],
+                               like_probability=0, comment_probability=1.0,
+                               action_interval=0, lazy_vision=True)
+        check("V05 延迟识图：无素材仍被守卫拦下",
+              not api5.describe_calls and not api5.comments)
+
+        # V06 C4 先识图再判：带图打卡 → 描述有效 → 正常评论（v1.7.0 语义不漂移）
+        api6 = _VisionApi(desc="跑步路线图，今日10公里")
+        feed6 = {**base, "tid": "v6", "content": "打卡第30天", "rt_con": "",
+                 "images": [], "image_urls": ["https://qzone.example/run.jpg"]}
+        await at.process_feeds(None, api6, _FakeStore(), [feed6],
+                               like_probability=0, comment_probability=1.0,
+                               action_interval=0, lazy_vision=True)
+        check("V06 C4 先识图再判：带图打卡正常评论（语义不漂移）",
+              len(api6.describe_calls) == 1 and len(api6.comments) == 1,
+              f"识图={len(api6.describe_calls)} 评论={len(api6.comments)}")
+
+        # V07 纯文字打卡（无图）→ 零识图、C4 降级只点赞
+        api7 = _VisionApi()
+        feed7 = {**base, "tid": "v7", "content": "打卡第30天", "rt_con": "",
+                 "images": [], "image_urls": []}
+        await at.process_feeds(None, api7, _FakeStore(), [feed7],
+                               like_probability=1.0, comment_probability=1.0,
+                               action_interval=0, lazy_vision=True)
+        check("V07 纯文字打卡：零识图，C4 降级只点赞",
+              not api7.describe_calls and not api7.comments and api7.likes == ["v7"])
+
+        # V08 识图异常 → 不阻断点赞，按缺图口径走（不抛异常）
+        class _BoomVisionApi(_VisionApi):
+            async def _describe_images(self, urls, *a, **kw):
+                raise RuntimeError("VLM 炸了")
+
+        api8 = _BoomVisionApi()
+        feed8 = {**base, "tid": "v8", "content": "有正文的说说", "rt_con": "",
+                 "images": [], "image_urls": ["https://qzone.example/e.jpg"]}
+        await at.process_feeds(None, api8, _FakeStore(), [feed8],
+                               like_probability=1.0, comment_probability=1.0,
+                               action_interval=0, lazy_vision=True)
+        check("V08 延迟识图失败不阻断：点赞照常、正文仍可评论",
+              api8.likes == ["v8"] and len(api8.comments) == 1)
+
+        # ── P3 双保险判重 ────────────────────────────────────────────
+        # V09 评论区已有 bot 自己 → 跳过并标记（store 无记录也拦）
+        api9 = _VisionApi(uin="10001")
+        store9 = _FakeStore()
+        feed9 = {**base, "tid": "v9", "content": "老说说", "rt_con": "", "images": [],
+                 "comments": [{"qq_account": "10001", "nickname": "bot",
+                               "comment_tid": 1, "content": "以前的评论"}]}
+        await at.process_feeds(None, api9, store9, [feed9],
+                               like_probability=1.0, comment_probability=1.0,
+                               action_interval=0)
+        check("V09 双保险：在线评论含自己→跳过且标记已处理",
+              not api9.comments and not api9.likes and await store9.is_processed("v9"))
+
+        # V10 只有他人评论 → 正常处理；昵称相同但 QQ 不同不误拦
+        api10 = _VisionApi(uin="10001")
+        feed10 = {**base, "tid": "v10", "content": "新说说", "rt_con": "", "images": [],
+                  "comments": [{"qq_account": "20001", "nickname": "bot",
+                                "comment_tid": 2, "content": "同名好友"}]}
+        await at.process_feeds(None, api10, _FakeStore(), [feed10],
+                               like_probability=0, comment_probability=1.0,
+                               action_interval=0)
+        check("V10 双保险只认QQ号：同名昵称不误拦",
+              len(api10.comments) == 1)
+
+        # V11 api 无 uin 属性 → 退回 store 单保险，不误拦
+        class _NoUinApi(_VisionApi):
+            def __init__(self):
+                super().__init__()
+                del self.uin
+
+        api11 = _NoUinApi()
+        feed11 = {**base, "tid": "v11", "content": "说说", "rt_con": "", "images": [],
+                  "comments": [{"qq_account": "10001", "comment_tid": 3, "content": "x"}]}
+        await at.process_feeds(None, api11, _FakeStore(), [feed11],
+                               like_probability=0, comment_probability=1.0,
+                               action_interval=0)
+        check("V11 uin 取不到时退回单保险（不误拦）", len(api11.comments) == 1)
+
+        # ── P2 抖动 ─────────────────────────────────────────────────
+        # V12 默认抖动 5 分钟：sleep 落在 [25, 35] 分钟且不全相等
+        loop_plugin = types.SimpleNamespace(config=types.SimpleNamespace(
+            auto=types.SimpleNamespace(interval_min=30)))
+        loop = at.AutoTaskLoop(loop_plugin, None)
+        samples = [loop._next_sleep_sec() for _ in range(50)]
+        check("V12 默认抖动：sleep∈[25min,35min] 且有随机性",
+              all(25 * 60 <= s <= 35 * 60 for s in samples) and len(set(samples)) > 1,
+              f"min={min(samples):.0f}s max={max(samples):.0f}s")
+
+        # V13 jitter=0 → 完全旧行为（恒等于 interval）
+        loop0 = at.AutoTaskLoop(types.SimpleNamespace(config=types.SimpleNamespace(
+            auto=types.SimpleNamespace(interval_min=30, interval_jitter_min=0))), None)
+        check("V13 jitter=0 恒等于 interval（旧行为）",
+              all(loop0._next_sleep_sec() == 1800 for _ in range(10)))
+
+        # V14 越界钳制：jitter=999 → 钳到 interval/2，sleep 恒正
+        loop_big = at.AutoTaskLoop(types.SimpleNamespace(config=types.SimpleNamespace(
+            auto=types.SimpleNamespace(interval_min=10, interval_jitter_min=999))), None)
+        big = [loop_big._next_sleep_sec() for _ in range(50)]
+        check("V14 抖动钳到 interval/2，sleep 恒正",
+              all(300 <= s <= 900 for s in big), f"min={min(big):.0f}s")
+
+        # V15 配置缺失/异常 → 代码级默认 5 分钟（边界 B：老 config 无字段也生效）
+        loop_missing = at.AutoTaskLoop(types.SimpleNamespace(config=types.SimpleNamespace(
+            auto=types.SimpleNamespace(interval_min=30, interval_jitter_min="不是数字"))), None)
+        check("V15 抖动配置异常退回代码级默认 5 分钟",
+              loop_missing._jitter_sec() == 300.0)
+
+        # ── 结构锁 ──────────────────────────────────────────────────
+        # V16 image_urls 字段：两条拉取路径都返回（MockTransport）
+        import httpx
+        crafted = json.dumps({"code": 0, "data": {"data": [{
+            "appid": "311", "uin": "20001", "key": "tidv",
+            "feedstime": "2026-01-01 12:00",
+            "html": ("<div class='f-info'>正文</div><div class='img-box'>"
+                     "<img src='https://qzone.example/x.jpg'/>"
+                     "<img src='https://qzone.example/x.jpg'/></div>"),
+        }]}}, ensure_ascii=False)
+
+        async def handler(request):
+            if "feeds3_html_more" in str(request.url):
+                return httpx.Response(200, text="_Callback(" + crafted + ");")
+            return httpx.Response(404)
+
+        api_v = qzone_api.QzoneAPI({"uin": "10001", "p_skey": "x"})
+        api_v._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        feeds_v = await api_v.get_qzone_list(describe_images=False)
+        await api_v.aclose()
+        check("V16 get_qzone_list 返回去重后的 image_urls（不识图）",
+              feeds_v and feeds_v[0].get("image_urls") == ["https://qzone.example/x.jpg"]
+              and feeds_v[0].get("images") == [],
+              str(feeds_v[0].get("image_urls")) if feeds_v else "空")
+
+        # V17 get_list 同样返回 image_urls（smallurl 优先）
+        msglist = json.dumps({"code": 0, "logininfo": {"name": "bot"}, "msglist": [{
+            "tid": "tidm", "uin": 20001, "created_time": 1700000000,
+            "content": "正文", "pic": [{"smallurl": "https://qzone.example/s.jpg",
+                                        "url1": "https://qzone.example/big.jpg"}],
+            "commentlist": [],
+        }]}, ensure_ascii=False)
+
+        async def handler2(request):
+            if "msglist_v6" in str(request.url):
+                return httpx.Response(200, text="_preloadCallback(" + msglist + ");")
+            return httpx.Response(404)
+
+        api_m = qzone_api.QzoneAPI({"uin": "10001", "p_skey": "x"})
+        api_m._client = httpx.AsyncClient(transport=httpx.MockTransport(handler2))
+        feeds_m = await api_m.get_list("20001", 5, filter=False, describe_images=False)
+        await api_m.aclose()
+        check("V17 get_list 返回 image_urls（smallurl 优先，不识图）",
+              feeds_m and feeds_m[0].get("image_urls") == ["https://qzone.example/s.jpg"]
+              and feeds_m[0].get("images") == [],
+              str(feeds_m[0].get("image_urls")) if feeds_m else "空")
+
+        # V18 命令语义锁：/说说互动 不传 lazy_vision（展示依赖描述）
+        import inspect
+        src_interact = inspect.getsource(plugin.QzoneFeedsPlugin.cmd_msglist_interact)
+        check("V18 /说说互动 仍走拉取即识图（命令语义红线）",
+              "lazy_vision" not in src_interact
+              and "describe_images=self._vision_enabled()" in src_interact)
+
+        # V19 规则层零改动锁：comment_policy.py 不含 v1.8.0 新增逻辑
+        cp_src = (Path(PLUGIN_DIR) / "comment_policy.py").read_text(encoding="utf-8")
+        check("V19 comment_policy 规则层零改动（无 lazy/image_urls 字样）",
+              "lazy" not in cp_src and "image_urls" not in cp_src)
+
+        # V20 run_auto_job 默认走延迟识图，关闭开关恢复旧行为
+        class _LazyCapApi:
+            def __init__(self):
+                self.calls = []
+
+            async def get_qzone_list(self, **kw):
+                self.calls.append(kw)
+                return []
+
+        p_lazy = _AutoPlugin()
+        api_l = _LazyCapApi()
+        await at.run_auto_job(p_lazy, api_l, _FakeStore(), None)
+        p_old = _AutoPlugin(auto_kw=dict(lazy_vision_enabled=False))
+        api_o = _LazyCapApi()
+        await at.run_auto_job(p_old, api_o, _FakeStore(), None)
+        check("V20 自动任务默认延迟识图，开关关闭恢复拉取即识图",
+              api_l.calls and api_l.calls[0].get("describe_images") is False
+              and api_o.calls and api_o.calls[0].get("describe_images") is True,
+              f"lazy={api_l.calls[0] if api_l.calls else None} "
+              f"old={api_o.calls[0] if api_o.calls else None}")
+    finally:
+        reply_manager._llm_generate = orig_llm
 
 
 def main():

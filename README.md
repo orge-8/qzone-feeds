@@ -4,6 +4,8 @@ MaiBot 插件：发 QQ 动态、读好友动态、VLM 识别动态配图、回�
 
 基于 [Maizone](https://github.com/internetsb/Maizone) 协议层移植重构，参考 [qzone-toolkit](https://github.com/gfhdhytghd/qzone-toolkit) 的风控思路。
 
+> **版本细节见 [CHANGELOG.md](CHANGELOG.md)** —— 本文件只写「怎么用、怎么配、怎么排障」。
+
 ## 命令（全部仅管理员）
 
 | 命令 | 说明 |
@@ -26,9 +28,7 @@ MaiBot 插件：发 QQ 动态、读好友动态、VLM 识别动态配图、回�
 - 评论内容由 LLM 生成（使用 `[auto] comment_prompt` 模板），发布前经过净化（剥 markdown、截断 100 字）
 - 去重走 `processed_list.json`：已处理过的动态不会再点赞评论
 - 评论文本包含动态的正文、转发内容与图片的文字描述（`[图: ...]`）
-- **评论素材守卫（v1.1.2）**：正文、转发内容、图片描述三者全为空时**跳过评论**（点赞照常）。
-  否则 LLM 会拿到一个空白内容并凭空发挥 —— 真机曾因此产出「哈哈转发了个寂寞，原内容是啥呀」
-  这类无意义评论（转发型动态的原内容当前尚未被解析，见下方「已知限制」）
+- **评论素材守卫**（v1.1.2）：详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 已知限制
 
@@ -41,39 +41,14 @@ MaiBot 插件：发 QQ 动态、读好友动态、VLM 识别动态配图、回�
 
 ## 变更记录
 
-- **评论发言纪律下沉到代码层**（v1.3.3）：三条生成路径（自动评论 / 回评 / 被@回复）
-  统一改走 `reply_manager.generate_guarded_comment`，纪律由
-  `comment_style.py` 在**代码层**追加，不再依赖用户可编辑模板。
-  - **为什么必须下沉**：`comment_prompt` / `reply.prompt` / `atme_prompt` 都是
-    首次运行即落盘 `config.toml` 的模板，**不随插件升级更新**——写在配置默认值里的
-    规则，对已部署实例等于没写（v1.2.9 的身份锚点就这么失效了一整个版本）。
-  - **发言纪律**（`STYLE_GUARD`，每条 prompt 末尾强制追加）：
-    ① 不复述/总结/点评对方内容；② 像朋友随手回一句、最多 20 字、宁可短；
-    ③ 梗/缩写/黑话读不懂就直说读不懂，禁止猜、禁止脑补；
-    ④ 禁成语/祝福语/书面语/官方腔；⑤ 实在接不上话只输出 `[跳过]`。
-  - **主动弃评出口**：模型输出 `[跳过]`/`[不评论]`/`[略过]` 即不发布。
-    「宁可短」的极端形态是「宁可不说」——不给出口，模型就只能硬凑套话。
-  - **语域拦截**（`looks_like_stiff_register`）：命中成语/祝语/公文体/汇报体
-    （双喜临门、祝您、请查收、都到位…）给**一次**重写机会（把不合格句当反例回灌）；
-    重写仍不合格则**放弃发布**（宁可少一条评论，不发通稿腔）。
-    特征表刻意不收口语高频词（到位 / 收到 / 完美 / 绝了），避免误拦正常回复。
-  - **默认模板同步**：去掉「请以 bot 身份」——那句会让模型进入自我指涉状态，
-    产出的正是官方通稿腔；长度约束也交给纪律段，模板不再重复写「不超过 N 字」。
-  - 触发事故（2026-10-03）：好友动态「喜报，无料有了，我奶找到了」→ bot 评论
-    「恭喜！双喜临门，无料和奶奶都到位啦！」被围观嘲笑。
-- **人物画像注入加自证日志**（v1.3.3）：画像真的注入成功时打一条 INFO
-  （`人物画像已注入: uid=… name=… 印象N行`）。此前只在 debug 打日志，
-  真机上从未被验证过是否生效。
-- **回复评论注入时间上下文**（v1.3.2）：回评与被@回复的 prompt 现在都带上
-  **该条互动的时间**与**当前时间**，LLM 能判断「这条评论是 3 天前发的」，
-  不再用「刚看到」的语气答旧评论。
-  - 时间归一化 `format_comment_time`：`createTime` 时间戳（秒/毫秒）→
-    `YYYY-MM-DD HH:MM:SS`；HTML 路径的「3小时前」这类文本原样保留；缺失 → 「未知」
-    （绝不返回空串，避免 prompt 出现「评论时间：；」）。
-  - 回评用 `{created_time}` / `{current_time}`（`{now_time}` 为别名）两个占位符；
-    被@回复用同一套。新增 `[auto] atme_prompt` 默认模板同步带上时间。
-  - **旧配置无需改动**：模板未引用时间占位符时（`config.toml` 已落盘不会随插件升级
-    更新），代码自动把缺的时间信息追加到 prompt 末尾——升级即生效。
+完整版本历史见 [CHANGELOG.md](CHANGELOG.md)（含 v1.5.0 表达风格、v1.4.0 宿主人设、v1.3.3 / v1.3.2 起的发言纪律、
+时间上下文注入等）。近期变更：
+
+- **评论时读宿主表达风格**（v1.5.0）：人设之外再注入 `reply_style`，两段均只作语气参考。详见 [CHANGELOG.md](CHANGELOG.md)。
+- **评论时读宿主人设**（v1.4.0）：三条发言路径统一注入，只作语气参考，纪律优先。详见 [CHANGELOG.md](CHANGELOG.md)。
+- **评论发言纪律下沉到代码层**（v1.3.3）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **人物画像注入加自证日志**（v1.3.3）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **回复评论注入时间上下文**（v1.3.2）：详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 配置
 
@@ -108,9 +83,19 @@ enable_atme_reply = false     # 被@检测与回复（「与我相关」接口�
 atme_poll_count = 10          # 每轮拉取「与我相关」条数（1~20）
 atme_max_replies_per_run = 5  # 单轮被@回复上限
 interval_min = 30             # 循环间隔（分钟）
+interval_jitter_min = 5       # v1.8.0：间隔随机抖动±N分钟（代码级默认5，钳到interval一半，0=关闭）
 silent_hours = "23:00-07:30"  # 静默时段（支持跨零点，逗号分隔多段）
 like_probability = 0.9
 comment_probability = 0.6
+lazy_vision_enabled = true    # v1.8.0：自动任务延迟识图（先决策后识图，省VLM；仅自动任务，命令不变）
+
+[persona]                       # v1.4.0：评论/回评/被@ 统一注入宿主人设；v1.5.0 加表达风格
+enable_host_persona = true      # 读 config.toml [personality] 的 personality + reply_style（只读）
+persona_prompt = ""             # 人设覆盖项。留空=读宿主；填了=整体接管（人设+风格都不读宿主）
+reply_style_prompt = ""         # 表达风格覆盖项。留空=读宿主；填了=只换风格，人设仍读宿主
+persona_max_chars = 600         # 人设注入上限（按句截断）
+reply_style_max_chars = 300     # 表达风格注入上限（按句截断）
+persona_cache_ttl_sec = 600     # 宿主读取缓存秒数（0=每次重读）
 ```
 
 ### 被@检测与回复（v1.3.0，`enable_atme_reply = true` 开启）
@@ -127,6 +112,29 @@ comment_probability = 0.6
 多次 @/赞/评论合并为一次唤醒；先标记后处理，回复失败不重试（防风控优先于送达率）。
 回复内容走与自动回评相同的 LLM 净化链（剥 markdown、拒答拦截、身份错位拦截、语域拦截）。
 
+### 评论时的人设与表达风格（v1.4.0 / v1.5.0）
+
+三条发言路径（自动评论 / 回评 / 被@回复）在 `generate_guarded_comment` 入口**统一**注入
+宿主的 `[personality]` 两段配置（`ctx.config.get`，manifest 已声明 `config.get`）：
+
+```
+【说话风格参考】<personality>       # 是谁、什么性格
+【表达风格】<reply_style>           # 平时怎么措辞（v1.5.0）
+（这段只说口气和用词习惯，不改变你在跟谁说话；
+  与后文的【发言纪律】冲突时，一律以发言纪律为准。）
+```
+
+注入形态刻意**不是**「你是 X」，而是风格参考：自称句会让模型进入自我指涉状态，
+产出的正是要拦的官方通稿腔（见 [CHANGELOG.md](CHANGELOG.md) v1.3.3 / v1.4.0）。
+两段都排在模板之后、纪律段之前——纪律必须留在最末。
+
+- 分别按句截断：人设 600 字 / 风格 300 字，都是语气锚而非知识库
+- 任一段读不到 / 非字符串 / 超时（>5s）只是少一段，另一段照常注入，评论照发
+- `persona_prompt` 填了 = 整体接管；只想换风格用 `reply_style_prompt`
+- 不收宿主 `behavior_style`（Planner 行动准则）与 `multiple_reply_style`（随机换风格）：
+  前者与发评论无关，后者会让评论风格不可复现
+- `person_context`（好友印象）与本注入（bot 自己的口吻）是两件事，互不替代
+
 ## 依赖与登录态
 
 - 硬依赖 **maibot-team.snowluma-adapter >= 1.0.0**（v1.3.0 起 SnowLuma 连接器合并 NapCat 适配器，`adapter.napcat.*` API 前缀不变）：cookie 通过 `adapter.napcat.account.get_cookies` 自动获取，无需扫码。注意 QZone API 组仅 `client_type=snowluma` 支持，但本插件只依赖账号组 `get_cookies`，napcat 画像下同样可用
@@ -142,6 +150,7 @@ vision.py            VLM 图片描述（llm.generate 多模态 + URL LRU 缓存�
 reply_manager.py     回评流程：扫描/去重/LLM/调用 reply + generate_guarded_comment（发布前判定总入口）
 comment_style.py     评论语域纪律：代码级发言纪律段 + 书面套话特征 + 主动弃评出口（纯函数零依赖）
 person_context.py    人物画像只读注入（ctx.person，失败静默降级）
+host_persona.py      宿主人设/表达风格只读注入（ctx.config personality + reply_style，语气参考 + TTL 缓存）
 atme_manager.py      「与我相关」被@检测与回复（正文@ / 评论@）
 auto_tasks.py        自动任务循环 + 静默时段解析 + 自动读动态点赞评论
 processed_store.py   已处理记录（LRU 200 feeds / 100 comments，防抖批量落盘）
@@ -151,81 +160,19 @@ processed_store.py   已处理记录（LRU 200 feeds / 100 comments，防抖批�
 - **自动重登**：cookie 失效（登录类错误码）自动强制刷新重试（默认 1 次）
 - **去重**：`processed_list.json`（`ctx.paths.data_dir`）记录已处理动态/评论，手动与自动共享
 - **反风控**：逐条操作间 `3~4s` 随机间隔；静默时段自动任务全停
-- **凭据与出站防护**（v1.1.1，v1.2.2 修订）：
-  - 读动态下载图片时，只对 QQ 图床域名（`.qzone.qq.com` / `.qzonestyle.gtimg.cn` / `.gtimg.cn` /
-    `.qpic.cn` / `.qq.com`）携带 cookie；**不在白名单的域名不是拒绝下载，而是降级为不带 cookie 下载**
-    ——白名单只决定"要不要带凭据"，不该决定"能不能取图"（v1.1.1 一律拒绝曾误杀
-    `m.qpic.cn` 等正常图床，真机表现为 VLM 描述全成"加载失败"）
-  - 带 cookie 时手动跟随重定向且**每一跳都重新校验域名**，跨域跳转直接中止，
-    防止 `p_skey` 被一条恶意 `<img src>` 或 302 带到第三方主机
-  - `/动态发图` 的用户可控地址做 SSRF 校验（拒绝内网 / 回环 / 链路本地 / 保留网段，主机名解析后逐条判定），且该链路下载时不带 Qzone cookie
-- **取图失败不写进评论素材**（v1.2.2）：图片描述中的占位符与失败标记
-  （`[图片]` / `[图片（识别失败）]` / `[图片（加载失败）]`）一律不进入 LLM prompt。
-  真机曾因把「加载失败」喂给模型，导致它在好友动态下公开评论「图裂了求补图」——
-  等于把自身取图故障当成对作者的吐槽。
-- **拒答文本绝不发布**（v1.2.4）：LLM 的拒答/元回复（「我不能按照你的要求进行创作」
-  「不符合健康的交流规范」「作为AI我无法…」等）命中特征即**跳过本次评论/回复**（fail-closed）。
-  这类文本是模型在对我们说话，不是给好友的话；真机事故：好友发「一年之后，阿哈将成为路边一坨」，
-  bot 把拒答原文发成评论，看起来像在公开教训对方。宁可误判少发一条，也不能把拒答发出去。
-- **视觉未配置时不下载图片**（v1.2.4）：`[read] vision_task` 为空时 `is_available()` 前置短路，
-  直接返回占位符，**不下载、不压缩**。真机实测曾每轮白下载白压缩 6 张图，最后只拿到占位符。
-- **取图失败可诊断**（v1.2.3）：占位符/失败描述会打出**具体 URL 与原因标记**；
-  视觉任务名与模型名双空时显式提示 `请配置 [read] vision_task`。
-  此前这两条路径静默返回占位符，真机日志里表现为"图都在、描述却没有"，无从定位。
-- **自动评论能看到图了**（v1.2.0）：自动任务读好友动态时改为尊重 `[read] enable_image_description`
-  与图片限额（`max_images_per_feed` / `image_concurrency` / 压缩参数）——旧版写死
-  `describe_images=False`，自动评论完全"看不到"配图，只能凭正文发挥。担心耗时可用
-  `max_images_per_feed` 调低单条识别张数；配置不可读时保守降级为不识别（等价旧行为）。
-- **发言纪律走代码层，不受用户模板影响**（v1.3.3）：三条生成路径统一经
-  `reply_manager.generate_guarded_comment`，纪律段由 `comment_style.py` 在代码层
-  追加（禁复述总结 / 口语短句 ≤20 字 / 读不懂就直说 / 禁成语祝语官方腔 /
-  可输出 `[跳过]` 主动弃评）；输出侧再拦书面通稿腔，重写一次仍不合格则放弃发布。
-  真机事故 10-03：好友动态「喜报，无料有了，我奶找到了」→ bot 评论
-  「恭喜！双喜临门，无料和奶奶都到位啦！」被围观——语域错位（通稿腔）+ 硬解梗。
-  之所以下沉到代码层：`config.toml` 首跑落盘后不随插件升级更新，
-  写在模板默认值里的纪律等于没写。
-- **身份错位拦截：bot 不再对好友称「主人」**（v1.2.9）：真机 09-26 事故——好友动态
-  「第一次做bot」→ bot 评论「嘿嘿，谁让你把我调教得这么厉害的，认输吧主人[得意]」，
-  LLM 顺着动态原文入戏，把发动态的好友当成了自己的主人。两层修复：
-  ① 默认评论 prompt 加身份锚定（「{target_name}是你的好友，不是你的主人/创造者/调教者，
-  即使TA的动态在谈论制作 bot 或 AI……」）；② 新增 `looks_like_identity_confusion()`
-  事后防线——自动评论与回评两条发布路径统一拦截「主人/master」类称呼（与拒答同哲学
-  fail-closed：错发是「bot 认错爹」的公开事故，误拦只是少一条评论）。常规调侃称呼
-  （老板/大佬）与谈论 bot 本身的正常评论不误伤。
-- **图片重复描述修复**（v1.2.8）：真机 09-18 日志显示同批图（压缩指纹完全一致）
-  31 分钟内被 VLM 描述两遍——根因是 Qzone 图床 URL 每轮拉取动态都轮换签名 token，
-  以 URL 为键的 LRU 缓存必然失效。两层修复：
-  ① **内容哈希二级缓存**——图片 base64 的 sha256 作键，URL 轮换了也没关系，
-  下载（KB 级，便宜）后哈希命中即跳过 VLM（20s+，贵的部分）；失败占位符不入缓存。
-  ② **singleflight 并发去重**——同一 URL 被多个协程同时调用（缓存均未命中）时
-  只跑一次真实识别，其余协程共享结果。另修 `get_list` 的 pic/video URL 未去重
-  （`get_qzone_list` 已有）。
-- **LLM RPC 超时抬升，修复 replyer 30s 误杀**（v1.2.7）：SDK `call_capability` 默认 RPC
-  传输超时 30s，低于 replyer 任务思考模型（`deepseek-v4-pro-think`，Host
-  `slow_threshold=120s`）的正常耗时下限——思考稍久就被 RPC 层以 `E_TIMEOUT` 误杀，
-  该条动态只点赞不评论。现经 SDK `call_capability` 的 `timeout_ms` **具名参数**
-  （SDK 自行消费、不混入业务 args，已在 maibot_sdk 源码验证转发链路）抬升：
-  reply_manager 120s（对齐 Host slow_threshold）、vision 55s（VLM 非思考模型）；
-  插件总闸 wait_for 相应抬至 130s / 60s 保持兜底。降级路径不变：超时→空串→跳过评论。
-- **评论注入人物画像**（v1.2.6）：评论好友动态前经 `ctx.person` 查询 MaiBot 自带人物库
-  （只读，不写入），昵称（`person_name` 属性）替换 prompt 里的裸 QQ 号、印象
-  （`memory_points` 列表，自动提取内容段、去权重噪声、截断至 5 条）以
-  「你对TA的了解：…」追加进 prompt。**全链路防御式降级**：人物库查不到 / 能力不存在 /
-  RPC 超时（5s）/ Host 失败 dict 一律静默回退——昵称退 QQ 号、画像消失不留痕，
-  未认识用户的「未知用户XXXX」占位名也拒绝采用，绝不阻塞评论主流程。
-  属性名可配（`person_name_field` / `person_state_field`），总开关 `enable_person_context`。
-  画像内容由 MaiBot 主框架在日常聊天中自动积累，本插件不产生写入。
-- **适配 MaiBot 1.2.5 的任务名/模型名拆分**（v1.2.1）：1.2.5 起 `llm.generate` 的 `model`
-  参数按**具体模型名**解释，任务名拆到新参数 `task_name`（SDK 2.8.1 默认 `utils`）。
-  本插件新增 `text_task` / `text_model_name` 与 `vision_task` / `vision_model_name` 字段；
-  旧配置（`text_model="replyer"`、`vision_model="vlm"` 存的是任务名）**无需改动**，
-  读取时自动迁移为任务名。LLM 失败日志会打出完整 kwargs 便于排查。
-- **性能优化**（v1.1.0）：
-  - 共享 httpx 连接池：每个 job 内所有请求复用同一 AsyncClient（省 TCP+TLS 握手）
-  - 已处理列表防抖落盘：mark 只改内存，2s 防抖批量写盘 + job 边界兜底（写盘次数降一个数量级）
-  - VLM 描述缓存：同一图片 URL 不重复下载/识别（单张省 20s+ 与全部 token，命中日志 `图片描述命中缓存`）
-  - VLM 下载小图优先（`smallurl`），下载字节数降 5~10 倍
-  - 图片压缩走内存 bytes 直传，只在送 VLM 边界做一次 base64 编码
+- **凭据与出站防护**（v1.1.1、v1.2.2）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **取图失败不写进评论素材**（v1.2.2）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **拒答文本绝不发布**（v1.2.4）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **视觉未配置时不下载图片**（v1.2.4）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **取图失败可诊断**（v1.2.3）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **自动评论能看到图了**（v1.2.0）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **发言纪律走代码层，不受用户模板影响**（v1.3.3）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **身份错位拦截：bot 不再对好友称「主人」**（v1.2.9）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **图片重复描述修复**（v1.2.8）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **LLM RPC 超时抬升，修复 replyer 30s 误杀**（v1.2.7）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **评论注入人物画像**（v1.2.6）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **适配 MaiBot 1.2.5 的任务名/模型名拆分**（v1.2.1）：详见 [CHANGELOG.md](CHANGELOG.md)。
+- **性能优化**（v1.1.0）：详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 相对上游 Maizone 的修正
 
