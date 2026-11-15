@@ -182,7 +182,7 @@ class AutoConfig(PluginConfigBase):
     person_state_field: str = Field(default="memory_points", description="人物印象属性名（memory_points 列表自动提取内容段）")
     # ── v1.7.0 评论决策策略 ────────────────────────────────────────────────
     # 边界 B：配置里只放「开关 + 阈值」。规则内容、判定顺序、reason 枚举、
-    # 三类 fail-closed 硬兜底（拒答/身份错位/亲昵语域）与 20 字上限全部
+    # 三类 fail-closed 硬兜底（拒答/身份错位/亲昵语域）与 50 字上限全部
     # 由 comment_policy.py 在代码层写死 —— config.toml 首跑落盘后不随插件
     # 升级更新，写在配置默认值里的规则对已部署实例等于没写（v1.2.9 等三次踩坑）。
     comment_policy_enabled: bool = Field(
@@ -190,9 +190,9 @@ class AutoConfig(PluginConfigBase):
         description="评论决策增强总开关：正向 few-shot、下笔前理解校验、打卡类动态分流。"
                     "关闭仅影响这三项新增引导；拒答/身份错位/亲昵语域三类拦截恒生效")
     max_comment_chars: int = Field(
-        default=20,
-        description="发布评论的最大字数（代码级硬上限 20，填更大值也只认 20；最小 1）。"
-                    "只钳制最终发布文本，不影响净化步骤")
+        default=50,
+        description="发布评论的最大字数（v1.8.1 起默认/硬上限 50，填更大值也只认 50；最小 1）。"
+                    "超长时优先切在最近的句子边界，不再字符级盲切；不影响净化步骤")
     stiff_retry_enabled: bool = Field(
         default=True,
         description="命中书面通稿腔时是否给 LLM 一次重写机会；关闭则直接弃评（拦截不放宽）")
@@ -243,7 +243,7 @@ class PersonaConfig(PluginConfigBase):
     reply_style_max_chars: int = Field(
         default=100,
         description=("表达风格注入的最大字符数（按句截断）。v1.6.0 起默认 100 且**硬上限 100**："
-                     "评论是公开短句，风格段过长会稀释发言纪律（真机实测 300 字 ≈ 一条 20 字评论的 15 倍）"))
+                     "评论是公开短句，风格段过长会稀释发言纪律（真机实测 reply_style 416 字，风格段须远短于此）"))
     persona_cache_ttl_sec: int = Field(
         default=600,
         description="宿主人设/风格读取结果的缓存秒数（避免每条评论都走一次 Host RPC）；0 表示每次重读")

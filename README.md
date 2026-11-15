@@ -25,7 +25,7 @@ MaiBot 插件：发 QQ 动态、读好友动态、VLM 识别动态配图、回�
 `/说说互动 <QQ号>` 读到动态后会逐条处理未处理过的条目（**注意：这是写操作，会真实点赞评论**）：
 
 - 点赞 + 评论概率固定 1.0（显式指令即显式意图，不走配置概率）
-- 评论内容由 LLM 生成（使用 `[auto] comment_prompt` 模板），发布前经过净化（剥 markdown、截断 100 字）
+- 评论内容由 LLM 生成（使用 `[auto] comment_prompt` 模板），发布前经过净化（剥 markdown、截断 100 字）与发言纪律检查；最终发布文本按 `[auto] max_comment_chars` 钳制（v1.8.1 起默认 50，超长切最近句子边界）
 - 去重走 `processed_list.json`：已处理过的动态不会再点赞评论
 - 评论文本包含动态的正文、转发内容与图片的文字描述（`[图: ...]`）
 - **评论素材守卫**（v1.1.2）：详见 [CHANGELOG.md](CHANGELOG.md)。
@@ -88,6 +88,7 @@ silent_hours = "23:00-07:30"  # 静默时段（支持跨零点，逗号分隔多
 like_probability = 0.9
 comment_probability = 0.6
 lazy_vision_enabled = true    # v1.8.0：自动任务延迟识图（先决策后识图，省VLM；仅自动任务，命令不变）
+max_comment_chars = 50        # v1.8.1：发布评论字数上限（默认/硬上限50；超长切最近句子边界，不再盲切）
 
 [persona]                       # v1.4.0：评论/回评/被@ 统一注入宿主人设；v1.5.0 加表达风格
 enable_host_persona = true      # 读 config.toml [personality] 的 personality + reply_style（只读）

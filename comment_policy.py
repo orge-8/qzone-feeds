@@ -30,8 +30,12 @@ from dataclasses import dataclass
 # ══════════════════════════════════════════════════════════════════
 
 #: C1：发布评论的最大字数。配置只能调小，上限写死在代码里。
-MAX_COMMENT_CHARS_CEILING = 20
-DEFAULT_MAX_COMMENT_CHARS = 20
+#: v1.8.1 修订：20 → 50。v1.7.0 的 20 字上限 + 字符级盲切在真机上
+#: 「评论全部都截断」——中文口语评论常见 20~40 字，且回评默认模板本就
+#: 引导「不超过50字」，引导与发布上限自相矛盾。50 与净化层
+#: （_MAX_PUBLISH_CHARS=100）之间仍留安全余量，防注入长文的职责不变。
+MAX_COMMENT_CHARS_CEILING = 50
+DEFAULT_MAX_COMMENT_CHARS = 50
 
 #: 边界 B：三类 fail-closed 硬兜底，任何配置下都不可关。
 HARD_RULE_IDS = ("refusal", "identity", "romantic")
@@ -42,7 +46,7 @@ SKIP_SENTINELS = ("[跳过]", "[不评论]", "[略过]")
 STYLE_GUARD = (
     "\n\n【发言纪律·必须遵守】"
     "1. 不要复述、总结或点评对方说了什么，不要写总结式开头。"
-    "2. 像朋友随手回一句，最多20字，一句话能说完就别写第二句，宁可短。"
+    "2. 像朋友随手回一句，最多50字，一两句能说完就别写长，宁可短。"
     "3. 对方的梗、缩写、黑话读不懂就直说读不懂（「没看懂」「啥意思」），"
     "不许猜、不许脑补、不许硬解释成一个像样的意思。"
     "4. 不许用成语、祝福语、书面语和官方腔"
@@ -52,7 +56,7 @@ STYLE_GUARD = (
 
 RETRY_HINT = (
     "\n\n你上一句是「{bad}」——这是书面通稿腔，不是朋友在说话，不能发布。"
-    "请重写一句更短更口语的，最多15字；读不懂就说读不懂；"
+    "请重写一句更短更口语的，最多40字；读不懂就说读不懂；"
     "实在接不上话就只输出 [跳过]。"
 )
 
@@ -162,7 +166,7 @@ def resolve_policy(plugin) -> Policy:
         raw_chars = int(_cfg_get(cfg, "max_comment_chars", DEFAULT_MAX_COMMENT_CHARS))
     except (TypeError, ValueError):
         raw_chars = DEFAULT_MAX_COMMENT_CHARS
-    # 上限写死：配置填 100 也只认 20。
+    # 上限写死：配置填 100 也只认 50。
     max_chars = max(1, min(raw_chars, MAX_COMMENT_CHARS_CEILING))
 
     return Policy(
@@ -245,7 +249,13 @@ def evaluate(text: str, policy: Policy | None = None) -> tuple[str, str]:
 
 
 def clamp_publish_text(text: str, policy: Policy | None = None) -> str:
-    """C1：发布前把文本硬截到策略字数（默认 20，上限 20 写死）。
+    """C1：发布前把文本钳到策略字数（v1.8.1 起默认 50，上限 50 写死）。
+
+    v1.8.1 修订：超长时**不再字符级盲切**（v1.7.0 的 [:20] 是真机
+    「评论全部都截断」的直接原因），改为在窗口内回退到最近的句子/分句
+    边界，切在完整语义处；只有整段找不到任何边界（如注入的无标点长文）
+    才退回硬截兜底——防 prompt injection 长文的职责不变。
+    回退点须落在窗口后半段，避免切得太碎丢掉主要内容。
 
     注意刻意**不改** `sanitize_llm_output` 的 100 字默认行为：那是净化步骤，
     stiff 检测与重写反例回灌都依赖完整文本，且既有 A16 用例断言它硬截 100 字。
@@ -254,7 +264,14 @@ def clamp_publish_text(text: str, policy: Policy | None = None) -> str:
     if not text:
         return text
     limit = max(1, min(int(policy.max_comment_chars), MAX_COMMENT_CHARS_CEILING))
-    return str(text)[:limit]
+    t = str(text)
+    if len(t) <= limit:
+        return t
+    window = t[:limit]
+    cut = max(window.rfind(ch) for ch in "。！？!?；;，,\n") + 1
+    if cut >= max(2, limit // 2):
+        return window[:cut].rstrip()
+    return window
 
 
 def build_guard_text(prompt: str, policy: Policy | None = None) -> str:

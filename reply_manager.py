@@ -257,7 +257,8 @@ async def generate_guarded_comment(plugin, prompt: str) -> tuple[str, str]:
     2. 生成 → 弃评标记 / 净化 / 规则表逐项检查（refusal→identity→romantic→stiff）；
     3. stiff 时给**一次**重写机会（把不合格句当反例回灌，可配置关闭）；
     4. 重写仍不合格 → 放弃发布（宁可少一条评论，不发通稿腔）；
-    5. C1：返回前把文本硬截到 policy.max_comment_chars（上限 20 写死）。
+    5. C1：返回前把文本钳到 policy.max_comment_chars（v1.8.1 起默认/上限 50，
+       超长切最近句子边界，不再字符级盲切）。
 
     注：人设注入放在本函数而不是三条调用路径里，是为了让"三路统一"
     由结构保证（只在某条路径上注入，等于三处口吻漂移）。
